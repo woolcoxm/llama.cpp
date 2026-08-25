@@ -201,7 +201,6 @@ static ggml_backend_buffer_t ggml_backend_axcl_buffer_type_alloc_buffer(ggml_bac
     // fusion routes small norm/gate weights into our buffer beyond llama.cpp's
     // size estimate; add slack so the ctx allocator never runs dry
     const size_t slack = 64ull * 1024 * 1024;
-    fprintf(stderr, "[axcl-buf] alloc_buffer(%zu MB + %zu slack)\n", size / 1024 / 1024, slack / 1024 / 1024);
     void * ptr = malloc(size + slack);
     if (ptr == nullptr) {
         fprintf(stderr, "[axcl-buf] HOST ALLOC FAILED for %zu bytes\n", size + slack);
@@ -433,15 +432,12 @@ static void axcl_attn_load() {
     const char * env = getenv("AXCL_ATTN_MODEL");
     const char * path = env ? env : "/usr/local/share/ggml-axcl/attn_h16_d128_t512.axmodel";
     FILE * f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "[axcl-attn] file not found: %s\n", path); return; }
+    if (!f) return;
     fclose(f);
-    axclError le = axclrtEngineLoadFromFile(path, &g_attn.model);
-    if (le != AXCL_SUCC) {
-        fprintf(stderr, "[axcl-attn] load failed: %d for %s\n", (int) le, path);
+    if (axclrtEngineLoadFromFile(path, &g_attn.model) != AXCL_SUCC) {
         g_attn.model = 0;
         return;
     }
-    fprintf(stderr, "[axcl-attn] loaded model=%llx\n", (unsigned long long) g_attn.model);
     axclrtEngineGetIOInfo(g_attn.model, &g_attn.info);
     axclrtEngineCreateIO(g_attn.info, &g_attn.io);
     axclrtEngineCreateContext(g_attn.model, &g_attn.ectx);
@@ -519,7 +515,6 @@ static bool axcl_attn_run(const float * q, const float * k_cache, const float * 
 }
 
 static void axcl_weight_pool_init() {
-    fprintf(stderr, "[axcl-pool] pool_init called\n");
     if (g_axcl_pool.base != nullptr) {
         return;
     }
@@ -534,7 +529,6 @@ static void axcl_weight_pool_init() {
         return;
     }
     g_axcl_pool.base = g_axcl_pool.bump = (char *) p;
-    fprintf(stderr, "[axcl-pool] pool alloc OK\n");
     g_axcl_pool.remain = mb * 1024 * 1024;
     GGML_LOG_INFO("ggml-axcl: weight pool ready (%zu MB)\n", mb);
 }
@@ -882,11 +876,6 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
     const int64_t ne0  = node->ne[0];
     const int64_t nr   = ggml_nrows(node); // rows of ne0
 
-    fprintf(stderr, "[axcl-hop] %s ne=(%lld,%lld,%lld,%lld) src0=(%lld,%lld,%lld,%lld)\n",
-            ggml_op_name(node->op), (long long) node->ne[0], (long long) node->ne[1],
-            (long long) node->ne[2], (long long) node->ne[3],
-            (long long) src0->ne[0], (long long) src0->ne[1],
-            (long long) src0->ne[2], (long long) src0->ne[3]);
     switch (node->op) {
         case GGML_OP_RMS_NORM: {
             float eps;
@@ -1291,7 +1280,6 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                                      n1->src[0], n2->src[0], n3->src[0],
                                      (float *) n1->data, (float *) n2->data, (float *) n3->data)) {
                         done.insert(i); done.insert(i+1); done.insert(i+2); done.insert(i+3);
-                        fprintf(stderr, "[axcl-fuse] QKV pattern at node %d -> 1 engine call\n", i);
                         i += 3; // skip past
                     }
                 }
@@ -1307,8 +1295,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     if (axcl_gate_up_run(n0->src[1], n0->src[0], n1->src[0],
                                           (float *) n0->data, (float *) n1->data)) {
                         done.insert(i); done.insert(i+1);
-                        fprintf(stderr, "[axcl-fuse] gate+up pattern at node %d -> 1 engine call\n", i);
-                        i += 1;
+                                i += 1;
                     }
                 }
             }
@@ -1318,12 +1305,6 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (done.count(i)) continue;
         struct ggml_tensor * node = cgraph->nodes[i];
-        static int trace_n = 0;
-        if (trace_n < 60) {
-            fprintf(stderr, "[T] %s ne=(%lld,%lld,%lld)\n", ggml_op_name(node->op),
-                    (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2]);
-            trace_n++;
-        }
 
         if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW ||
             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
@@ -1416,12 +1397,10 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 prof_hostops++;
             }
         } else {
-            fprintf(stderr, "[axcl-unsupported] node %d op %s\n", i, ggml_op_name(node->op));
             GGML_LOG_ERROR("ggml-axcl: node %d op %s not supported\n", i, ggml_op_name(node->op));
             return GGML_STATUS_ABORTED;
         }
     }
-    fprintf(stderr, "[axcl-dbg] graph done: %d nodes ok\n", cgraph->n_nodes);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1445,7 +1424,6 @@ static const struct ggml_backend_i ggml_backend_axcl_interface = {
 };
 
 ggml_backend_t ggml_backend_axcl_init(int32_t device) {
-    fprintf(stderr, "[axcl-pool] backend_init entry\n");
     if (device < 0 || device >= axcl_get_device_count()) {
         GGML_LOG_ERROR("ggml-axcl: invalid device %d\n", device);
         return nullptr;
