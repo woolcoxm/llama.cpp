@@ -670,6 +670,137 @@ static void ggml_backend_axcl_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// stride-aware element accessor: flat index -> byte offset
+static size_t axcl_off(const struct ggml_tensor * t, int64_t i0, int64_t i1, int64_t i2, int64_t i3) {
+    return (size_t) i0 * t->nb[0] + (size_t) i1 * t->nb[1] + (size_t) i2 * t->nb[2] + (size_t) i3 * t->nb[3];
+}
+
+static uint64_t prof_hostops = 0;
+
+// host-side compute for the fusion ops; tensors live in our host buffers.
+// returns false when the op is not ours
+static bool ggml_axcl_host_op(struct ggml_tensor * node) {
+    const struct ggml_tensor * src0 = node->src[0];
+    const struct ggml_tensor * src1 = node->src[1];
+    float *       dst  = (float *) ((char *) node->data);
+    const int64_t ne0  = node->ne[0];
+    const int64_t nr   = ggml_nrows(node); // rows of ne0
+
+    switch (node->op) {
+        case GGML_OP_RMS_NORM: {
+            float eps;
+            memcpy(&eps, node->op_params, sizeof(eps));
+            const float * x = (const float *) src0->data;
+            const float * w = (const float *) src1->data;
+            for (int64_t r = 0; r < nr; r++) {
+                const float * xr = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
+                float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                double ss = 0.0;
+                for (int64_t i = 0; i < ne0; i++) ss += (double) xr[i] * xr[i];
+                float rms = (float) (1.0 / sqrt(ss / ne0 + eps));
+                for (int64_t i = 0; i < ne0; i++) dr[i] = xr[i] * rms * w[i];
+            }
+            (void) x; (void) dst;
+            break;
+        }
+        case GGML_OP_ADD:
+        case GGML_OP_MUL: {
+            const bool mul = (node->op == GGML_OP_MUL);
+            // scalar broadcast or same-shape (the only shapes in our splits)
+            const int64_t ne = ggml_nbytes(node) / 4; // f32 contiguous fast path
+            const bool same = src0->nb[0] == 4 && src1->nb[0] == 4 &&
+                              (src1->ne[0] * ((src1->ne[1] > 1 ? src1->ne[1] : 1)) == 1 || ne0 == src1->ne[0]);
+            if (same && src0->nb[1] == (size_t) ne0 * 4 && node->nb[1] == (size_t) ne0 * 4 &&
+                (src1->ne[0] * src1->ne[1] == 1 || src1->nb[1] == (size_t) src1->ne[0] * 4)) {
+                const float * a = (const float *) src0->data;
+                const float * b = (const float *) src1->data;
+                const bool scalar = (src1->ne[0] * src1->ne[1] == 1);
+                for (int64_t i = 0; i < ne; i++) {
+                    dst[i] = mul ? a[i] * (scalar ? b[0] : b[i]) : a[i] + (scalar ? b[0] : b[i]);
+                }
+            } else {
+                for (int64_t r = 0; r < nr; r++) {
+                    const float * a = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
+                    const float * b = (const float *) ((char *) src1->data + (size_t) (r % src1->ne[1]) * src1->nb[1]);
+                    float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                    for (int64_t i = 0; i < ne0; i++) {
+                        float bv = (src1->ne[0] == 1) ? b[0] : b[i];
+                        dr[i] = mul ? a[i] * bv : a[i] + bv;
+                    }
+                }
+            }
+            break;
+        }
+        case GGML_OP_GLU: {
+            // fused activation gate: out = act(x[:h]) * x[h:], h = ne0/2
+            int glu;
+            memcpy(&glu, node->op_params, sizeof(glu));
+            const int64_t h = ne0 / 2;
+            for (int64_t r = 0; r < nr; r++) {
+                const float * x  = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
+                float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                for (int64_t i = 0; i < h; i++) {
+                    float a = x[i], b = x[h + i], act;
+                    switch ((enum ggml_glu_op) glu) {
+                        case GGML_GLU_OP_REGLU:     act = a > 0 ? a : 0; break;
+                        case GGML_GLU_OP_GEGLU:     act = a * (1.0f / (1.0f + expf(-a))); break;
+                        case GGML_GLU_OP_SWIGLU_OAI: { float s = 1.0f + expf(-a); act = (a / s) * (a / s); } break;
+                        default:                    act = a / (1.0f + expf(-a)); break;
+                    }
+                    dr[i] = act * b;
+                }
+            }
+            break;
+        }
+        case GGML_OP_SOFT_MAX: {
+            float params[2] = {1.0f, 0.0f};
+            memcpy(params, node->op_params, sizeof(params));
+            const float scale = params[0];
+            for (int64_t r = 0; r < nr; r++) {
+                const float * x = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
+                float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                float mx = -INFINITY;
+                for (int64_t i = 0; i < ne0; i++) mx = fmaxf(mx, x[i] * scale);
+                float sum = 0.0f;
+                for (int64_t i = 0; i < ne0; i++) { dr[i] = expf(x[i] * scale - mx); sum += dr[i]; }
+                float inv = 1.0f / sum;
+                for (int64_t i = 0; i < ne0; i++) dr[i] *= inv;
+            }
+            break;
+        }
+        case GGML_OP_SCALE: {
+            float v;
+            memcpy(&v, node->op_params, sizeof(v));
+            for (int64_t r = 0; r < nr; r++) {
+                const float * x = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
+                float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                for (int64_t i = 0; i < ne0; i++) dr[i] = x[i] * v;
+            }
+            break;
+        }
+        case GGML_OP_CPY:
+        case GGML_OP_DUP: {
+            // same-layout f32 copy (fast path contiguous)
+            const int64_t ne = ggml_nbytes(node) / 4;
+            if (src0->nb[0] == 4 && node->nb[0] == 4 &&
+                (nr <= 1 || (src0->nb[1] == (size_t) ne0 * 4 && node->nb[1] == (size_t) ne0 * 4))) {
+                memcpy(node->data, src0->data, (size_t) ne * 4);
+            } else {
+                for (int64_t r = 0; r < nr; r++) {
+                    const float * x = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
+                    float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                    for (int64_t i = 0; i < ne0; i++) dr[i] = x[i];
+                }
+            }
+            break;
+        }
+        default:
+            return false;
+    }
+    prof_hostops++;
+    return true;
+}
+
 static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_axcl_context * ctx = (ggml_backend_axcl_context *) backend->context;
     axclrtSetDevice(axcl_get_device_index(ctx->device));
@@ -683,6 +814,9 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW ||
             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
             continue; // metadata-only: data pointer already correct
+        }
+        if (ggml_axcl_host_op(node)) {
+            continue; // fused host-side: no backend boundary
         }
         if (node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor * src0 = node->src[0];
@@ -845,6 +979,21 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
             return true;
+        default:
+            break;
+    }
+    // cheap host-side ops we compute ourselves: fusing these into our
+    // splits collapses the per-layer CPU<->NPU boundary count
+    switch (op->op) {
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_GLU: // silu expressed as GLU in this ggml
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_SCALE:
+        case GGML_OP_CPY:
+        case GGML_OP_DUP:
+            return op->type == GGML_TYPE_F32;
         default:
             break;
     }
