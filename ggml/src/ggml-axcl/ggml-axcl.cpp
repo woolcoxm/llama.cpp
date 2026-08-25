@@ -21,9 +21,11 @@
 #include "ggml-impl.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #define GGML_AXCL_NAME "AXCL"
@@ -236,6 +238,232 @@ ggml_backend_buffer_type_t ggml_backend_axcl_buffer_type(int32_t device) {
 }
 
 //
+// matmul engines (milestone 2)
+//
+// A GEMM .axmodel compiled by Pulsar2 with runtime inputs:
+//   Y[M,N] = X[M,K] (f16) @ W[K,N] (f16)
+// Shapes are static per engine; we look them up by (K, N) from
+// $AXCL_MATMUL_DIR (default /usr/local/share/ggml-axcl/matmul) with file
+// name pattern: matmul_m1_k{K}_n{N}.axmodel
+//
+// First light: X/W are staged in host buffers per call (the runtime DMAs
+// them to the card). Weight staging in CMM with upload-once semantics is
+// milestone 3.
+//
+
+#include "axcl_rt_engine.h"
+#include "axcl_rt_engine_type.h"
+
+struct axcl_matmul {
+    uint64_t model_id   = 0;
+    uint64_t context_id = 0;
+    axclrtEngineIOInfo io_info = nullptr;
+    axclrtEngineIO     io      = nullptr;
+
+    int64_t m = 0, k = 0, n = 0;
+
+    std::string x_name, w_name, y_name;
+    axclrtEngineDataType x_type = AXCL_DATA_TYPE_NONE;
+    axclrtEngineDataType w_type = AXCL_DATA_TYPE_NONE;
+    axclrtEngineDataType y_type = AXCL_DATA_TYPE_NONE;
+
+    // host staging buffers (runtime copies them to the card per execute)
+    std::vector<ggml_fp16_t> x_h; // [M, K]
+    std::vector<ggml_fp16_t> w_h; // [K, N]
+    std::vector<ggml_fp16_t> y_h; // [M, N]
+
+    void * y_out_ptr  = nullptr; // buffer returned by the runtime
+    uint64_t y_out_sz = 0;
+};
+
+static bool axcl_engine_global_init() {
+    static bool initialized = false;
+    static bool available   = false;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!initialized) {
+        // engine ops may run before any backend init (supports_op probes)
+        axclrtSetDevice(0);
+        axclError err = axclrtEngineInit(AXCL_VNPU_DISABLE);
+        available     = (err == AXCL_SUCC);
+        if (!available) {
+            GGML_LOG_ERROR("ggml-axcl: axclrtEngineInit failed with %d\n", (int) err);
+        }
+        initialized = true;
+    }
+    return available;
+}
+
+static std::string axcl_matmul_model_path(int64_t k, int64_t n) {
+    const char * dir = getenv("AXCL_MATMUL_DIR");
+    char         path[512];
+    snprintf(path, sizeof(path), "%s/matmul_m1_k%lld_n%lld.axmodel",
+             dir ? dir : "/usr/local/share/ggml-axcl/matmul", (long long) k, (long long) n);
+    return path;
+}
+
+static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
+    if (!axcl_engine_global_init()) {
+        return nullptr;
+    }
+
+    axcl_matmul * mm = new axcl_matmul();
+    mm->m = 1;
+    mm->k = k;
+    mm->n = n;
+
+    std::string path = axcl_matmul_model_path(k, n);
+    if (axclrtEngineLoadFromFile(path.c_str(), &mm->model_id) != AXCL_SUCC) {
+        GGML_LOG_WARN("ggml-axcl: no matmul engine at %s\n", path.c_str());
+        delete mm;
+        return nullptr;
+    }
+
+    if (axclrtEngineCreateContext(mm->model_id, &mm->context_id) != AXCL_SUCC ||
+        axclrtEngineGetIOInfo(mm->model_id, &mm->io_info) != AXCL_SUCC ||
+        axclrtEngineCreateIO(mm->io_info, &mm->io) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: failed to create context/IO for %s\n", path.c_str());
+        delete mm;
+        return nullptr;
+    }
+
+    uint32_t n_in = axclrtEngineGetNumInputs(mm->io_info);
+    uint32_t n_out = axclrtEngineGetNumOutputs(mm->io_info);
+
+    // expected: 2 inputs (X, W) + 1 output (Y)
+    for (uint32_t i = 0; i < n_in && i < 2; i++) {
+        const char * name = axclrtEngineGetInputNameByIndex(mm->io_info, i);
+        if (name != nullptr) {
+            (i == 0 ? mm->x_name : mm->w_name) = name;
+            axclrtEngineDataType t = AXCL_DATA_TYPE_NONE;
+            if (axclrtEngineGetInputDataType(mm->io_info, i, &t) == AXCL_SUCC) {
+                (i == 0 ? mm->x_type : mm->w_type) = t;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < n_out && i < 1; i++) {
+        const char * name = axclrtEngineGetOutputNameByIndex(mm->io_info, i);
+        if (name != nullptr) {
+            mm->y_name = name;
+            axclrtEngineDataType t = AXCL_DATA_TYPE_NONE;
+            if (axclrtEngineGetOutputDataType(mm->io_info, i, &t) == AXCL_SUCC) {
+                mm->y_type = t;
+            }
+        }
+    }
+
+    mm->x_h.resize(k);
+    mm->w_h.resize(k * n);
+    mm->y_h.resize(n);
+
+    GGML_LOG_INFO("ggml-axcl: matmul engine loaded %s (inputs '%s','%s' types %d,%d -> '%s' type %d)\n",
+                  path.c_str(), mm->x_name.c_str(), mm->w_name.c_str(), (int) mm->x_type, (int) mm->w_type,
+                  mm->y_name.c_str(), (int) mm->y_type);
+
+    return mm;
+}
+
+// shape-keyed cache with negative-result memoization
+static axcl_matmul * axcl_matmul_get(int64_t k, int64_t n) {
+    struct Cache {
+        std::mutex mutex;
+        std::unordered_map<uint64_t, axcl_matmul *> engines; // key: (k << 32) | n
+        std::unordered_map<uint64_t, bool>        missing;
+    };
+    static Cache cache;
+
+    const uint64_t key = ((uint64_t) k << 32) | (uint32_t) n;
+
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    auto it = cache.engines.find(key);
+    if (it != cache.engines.end()) {
+        return it->second;
+    }
+    if (cache.missing.count(key)) {
+        return nullptr;
+    }
+    axcl_matmul * mm = axcl_matmul_load(k, n);
+    if (mm) {
+        cache.engines[key] = mm;
+    } else {
+        cache.missing[key] = true;
+    }
+    return mm;
+}
+
+// dequantize src0 (ggml weight, [K x N] row-major, ne0 = K) into a
+// transposed f16 [K, N] row-major host buffer: w[k*N + n] = src0[n][k]
+static void axcl_dequant_any_to_f16_transposed(const struct ggml_tensor * t, ggml_fp16_t * w16) {
+    const int64_t k = t->ne[0];
+    const int64_t n = t->ne[1];
+    if (t->type == GGML_TYPE_F32) {
+        const float * w = (const float *) t->data;
+        for (int64_t nn = 0; nn < n; nn++) {
+            for (int64_t kk = 0; kk < k; kk++) {
+                w16[kk * n + nn] = GGML_COMPUTE_FP32_TO_FP16(w[nn * k + kk]);
+            }
+        }
+    } else if (t->type == GGML_TYPE_F16) {
+        const ggml_fp16_t * w = (const ggml_fp16_t *) t->data;
+        for (int64_t nn = 0; nn < n; nn++) {
+            for (int64_t kk = 0; kk < k; kk++) {
+                w16[kk * n + nn] = w[nn * k + kk];
+            }
+        }
+    } else {
+        GGML_ABORT("ggml-axcl: unsupported weight type %s", ggml_type_name(t->type));
+    }
+}
+
+static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor * src0,
+                                      const struct ggml_tensor * src1, struct ggml_tensor * dst) {
+    const int64_t k = mm->k;
+    const int64_t n = mm->n;
+    const int64_t m = mm->m; // 1
+
+    // X: activation, src1 is [K, 1] f32 contiguous
+    const float * x32 = (const float *) src1->data;
+    for (int64_t i = 0; i < k; i++) {
+        mm->x_h[i] = GGML_COMPUTE_FP32_TO_FP16(x32[i]);
+    }
+
+    // W: dequant + transpose into [K, N]
+    axcl_dequant_any_to_f16_transposed(src0, mm->w_h.data());
+
+    if (axclrtEngineSetInputBufferByName(mm->io, mm->x_name.c_str(), mm->x_h.data(),
+                                         mm->x_h.size() * sizeof(ggml_fp16_t)) != AXCL_SUCC ||
+        axclrtEngineSetInputBufferByName(mm->io, mm->w_name.c_str(), mm->w_h.data(),
+                                         mm->w_h.size() * sizeof(ggml_fp16_t)) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: set input buffers failed\n");
+        return false;
+    }
+
+    if (axclrtEngineExecute(mm->model_id, mm->context_id, 0, mm->io) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: engine execute failed\n");
+        return false;
+    }
+
+    void *   y_ptr = nullptr;
+    uint64_t y_sz  = 0;
+    if (axclrtEngineGetOutputBufferByName(mm->io, mm->y_name.c_str(), &y_ptr, &y_sz) != AXCL_SUCC ||
+        y_ptr == nullptr) {
+        GGML_LOG_ERROR("ggml-axcl: get output buffer failed\n");
+        return false;
+    }
+
+    // Y: [1, N] f16 -> dst f32 [N, 1]
+    const ggml_fp16_t * y16 = (const ggml_fp16_t *) y_ptr;
+    float *             out = (float *) dst->data;
+    for (int64_t i = 0; i < n; i++) {
+        out[i] = GGML_COMPUTE_FP16_TO_FP32(y16[i]);
+    }
+    GGML_UNUSED(m);
+    return true;
+}
+
+
+
+//
 // backend
 //
 
@@ -255,12 +483,31 @@ static void ggml_backend_axcl_free(ggml_backend_t backend) {
 }
 
 static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
-    // unreachable in milestone 1: the device's supports_op returns false for
-    // every op, so the scheduler must not assign any nodes to this backend
-    GGML_UNUSED(backend);
-    GGML_UNUSED(cgraph);
-    GGML_LOG_ERROR("ggml-axcl: graph_compute reached with no supported ops (bug)\n");
-    return GGML_STATUS_ABORTED;
+    ggml_backend_axcl_context * ctx = (ggml_backend_axcl_context *) backend->context;
+    axclrtSetDevice(ctx->device);
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        struct ggml_tensor * node = cgraph->nodes[i];
+
+        if (node->op == GGML_OP_MUL_MAT) {
+            struct ggml_tensor * src0 = node->src[0];
+            axcl_matmul *        mm   = axcl_matmul_get(src0->ne[0], src0->ne[1]);
+            if (mm == nullptr) {
+                GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT k=%lld n=%lld has no engine\n", i,
+                               (long long) src0->ne[0], (long long) src0->ne[1]);
+                return GGML_STATUS_ABORTED;
+            }
+            if (!ggml_axcl_compute_mul_mat(mm, src0, node->src[1], node)) {
+                GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT failed\n", i);
+                return GGML_STATUS_ABORTED;
+            }
+        } else {
+            GGML_LOG_ERROR("ggml-axcl: node %d op %s not supported\n", i, ggml_op_name(node->op));
+            return GGML_STATUS_ABORTED;
+        }
+    }
+
+    return GGML_STATUS_SUCCESS;
 }
 
 static const struct ggml_backend_i ggml_backend_axcl_interface = {
@@ -387,9 +634,29 @@ static ggml_backend_buffer_t ggml_backend_axcl_device_buffer_from_host_ptr(ggml_
 
 static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    // milestone 2+: MUL_MAT via precompiled axmodel graphs
-    return false;
+    if (op->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const struct ggml_tensor * src0 = op->src[0];
+    const struct ggml_tensor * src1 = op->src[1];
+    if (src0 == nullptr || src1 == nullptr) {
+        return false;
+    }
+    // f32 compute path; quantized weight layouts land in milestone 3
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (ggml_n_dims(src0) != 2 || ggml_n_dims(src1) != 2) {
+        return false;
+    }
+    if (src1->ne[1] != 1) {
+        return false; // decode only (M == 1); prefill stays on CPU
+    }
+    // engine must exist for this (K, N)
+    return axcl_matmul_get(src0->ne[0], src0->ne[1]) != nullptr;
 }
 
 static bool ggml_backend_axcl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -397,9 +664,9 @@ static bool ggml_backend_axcl_device_supports_buft(ggml_backend_dev_t dev, ggml_
 }
 
 static bool ggml_backend_axcl_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    GGML_UNUSED(dev);
-    GGML_UNUSED(op);
-    return false; // TODO: true for MUL_MAT/MUL_MAT_ID once compute works
+    // run MUL_MAT on the NPU even though the weights live in CPU buffers:
+    // the compute path stages X/W from host memory per call
+    return ggml_backend_axcl_device_supports_op(dev, op);
 }
 
 static const struct ggml_backend_device_i ggml_backend_axcl_device_interface = {
