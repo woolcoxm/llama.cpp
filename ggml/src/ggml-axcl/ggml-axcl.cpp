@@ -424,7 +424,8 @@ static axcl_matmul * axcl_matmul_get(int64_t k, int64_t n) {
 }
 
 // dequantize src0 (ggml weight, [K x N] row-major, ne0 = K) into a
-// transposed f32 [K, N] row-major host buffer: w[k*N + n] = src0[n][k]
+// transposed f32 [K, N] row-major host buffer: w[k*N + n] = src0[n][k].
+// works for every ggml type via the public type-trait dequantizers
 static void axcl_dequant_any_to_f32_transposed(const struct ggml_tensor * t, float * w32) {
     const int64_t k = t->ne[0];
     const int64_t n = t->ne[1];
@@ -435,15 +436,16 @@ static void axcl_dequant_any_to_f32_transposed(const struct ggml_tensor * t, flo
                 w32[kk * n + nn] = w[nn * k + kk];
             }
         }
-    } else if (t->type == GGML_TYPE_F16) {
-        const ggml_fp16_t * w = (const ggml_fp16_t *) t->data;
-        for (int64_t nn = 0; nn < n; nn++) {
-            for (int64_t kk = 0; kk < k; kk++) {
-                w32[kk * n + nn] = GGML_COMPUTE_FP16_TO_FP32(w[nn * k + kk]);
-            }
+        return;
+    }
+    const ggml_type_traits_t * traits = ggml_get_type_traits(t->type);
+    GGML_ASSERT(traits && traits->to_float);
+    std::vector<float> row(k);
+    for (int64_t nn = 0; nn < n; nn++) {
+        traits->to_float((const void *) ((char *) t->data + nn * t->nb[1]), row.data(), k);
+        for (int64_t kk = 0; kk < k; kk++) {
+            w32[kk * n + nn] = row[kk];
         }
-    } else {
-        GGML_ABORT("ggml-axcl: unsupported weight type %s", ggml_type_name(t->type));
     }
 }
 
@@ -668,14 +670,18 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
     if (src0 == nullptr || src1 == nullptr) {
         return false;
     }
-    // f32 compute path; quantized weight layouts land in milestone 3
-    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+    // any weight type is fine - the dequant path uses ggml type traits
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 &&
+        (ggml_get_type_traits(src0->type) == nullptr || ggml_get_type_traits(src0->type)->to_float == nullptr)) {
         return false;
     }
     if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
         return false;
     }
-    if (ggml_n_dims(src0) != 2 || ggml_n_dims(src1) != 2) {
+    // src0 must be a true 2D weight; src1 [K,1] counts as 1-D to ggml_n_dims,
+    // so check the higher dims explicitly instead
+    if (ggml_n_dims(src0) != 2 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        src0->ne[2] != 1 || src0->ne[3] != 1) {
         return false;
     }
     if (src1->ne[1] != 1) {
