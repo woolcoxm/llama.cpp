@@ -1057,7 +1057,16 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
     }
     auto t4 = std::chrono::steady_clock::now();
 
-    axclError ex = axclrtEngineExecute(mm->model_id, mm->context_id, 0, io);
+    axclError ex;
+    static axclrtStream async_stream = nullptr;
+    static const bool use_async = getenv("GGML_AXCL_ASYNC") != nullptr;
+    if (use_async) {
+        if (async_stream == nullptr) axclrtCreateStream(&async_stream);
+        ex = axclrtEngineExecuteAsync(mm->model_id, mm->context_id, 0, io, async_stream);
+        if (ex == AXCL_SUCC) axclrtSynchronizeStream(async_stream);
+    } else {
+        ex = axclrtEngineExecute(mm->model_id, mm->context_id, 0, io);
+    }
     auto t5 = std::chrono::steady_clock::now();
     if (ex != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: engine execute failed\n");
