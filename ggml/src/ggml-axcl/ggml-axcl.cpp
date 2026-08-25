@@ -309,6 +309,8 @@ struct axcl_matmul {
     // by the weight tensor's data pointer, not the engine
     std::unordered_map<const void *, void *> dev_w;
     std::vector<float>                    w_h; // scratch for the one upload
+    // pre-bound IO per weight set (W + Y bound once; X rebound per call)
+    std::unordered_map<const void *, axclrtEngineIO> io_by_w;
 };
 
 static void axcl_preload_all_engines();
@@ -383,6 +385,11 @@ struct axcl_fused_engine {
     // weight staging: maps ggml weight tensor ptr -> device buffer
     std::unordered_map<const void *, void *> staged_w;
     std::vector<float> scratch;     // dequant scratch
+    // Pre-bound IO handles: rebinding weight addresses on every execute
+    // costs ~3ms/call in descriptor re-setup (isolated exec with fixed
+    // bindings runs 4x faster). One IO per weight set, created on first
+    // use, rotated thereafter — only the activation input is rebound.
+    std::unordered_map<const void *, axclrtEngineIO> io_by_w0;
 };
 
 static bool axcl_fused_load(axcl_fused_engine * fe, const char * path,
@@ -1026,15 +1033,31 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
 
     void * wbuf = w_uploaded ? dw : mm->dw;
     void * xbuf = dev_x_override != nullptr ? dev_x_override : mm->dx;
-    if (axclrtEngineSetInputBufferByIndex(mm->io, mm->x_idx, xbuf, (size_t) k * 4) != AXCL_SUCC ||
-        axclrtEngineSetInputBufferByIndex(mm->io, mm->w_idx, wbuf, (size_t) k * n * 4) != AXCL_SUCC ||
-        axclrtEngineSetOutputBufferByIndex(mm->io, mm->y_idx, mm->dy, (size_t) n * 4) != AXCL_SUCC) {
+    // pre-bound IO per weight set when staged (W + Y fixed; X rebound)
+    axclrtEngineIO io = mm->io;
+    if (w_uploaded) {
+        axclrtEngineIO & pb = mm->io_by_w[src0->data];
+        if (pb == nullptr) {
+            axclrtEngineCreateIO(mm->io_info, &pb);
+            axclrtEngineSetInputBufferByIndex(pb, mm->w_idx, wbuf, (size_t) k * n * 4);
+            axclrtEngineSetOutputBufferByIndex(pb, mm->y_idx, mm->dy, (size_t) n * 4);
+        }
+        io = pb;
+    } else {
+        // per-call weight upload path (prefill / pool miss): bind W + Y too
+        if (axclrtEngineSetInputBufferByIndex(io, mm->w_idx, wbuf, (size_t) k * n * 4) != AXCL_SUCC ||
+            axclrtEngineSetOutputBufferByIndex(io, mm->y_idx, mm->dy, (size_t) n * 4) != AXCL_SUCC) {
+            GGML_LOG_ERROR("ggml-axcl: bind device buffers failed\n");
+            return false;
+        }
+    }
+    if (axclrtEngineSetInputBufferByIndex(io, mm->x_idx, xbuf, (size_t) k * 4) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: bind device buffers failed\n");
         return false;
     }
     auto t4 = std::chrono::steady_clock::now();
 
-    axclError ex = axclrtEngineExecute(mm->model_id, mm->context_id, 0, mm->io);
+    axclError ex = axclrtEngineExecute(mm->model_id, mm->context_id, 0, io);
     auto t5 = std::chrono::steady_clock::now();
     if (ex != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: engine execute failed\n");
@@ -1557,13 +1580,18 @@ static bool axcl_gate_up_run(struct ggml_tensor * h, struct ggml_tensor * gate_w
     void * duw = axcl_fused_stage_w(&g_gate_up, up_w, gw_sz);
     if (!dgw || !duw) return false;
 
-    axclrtEngineSetInputBufferByIndex(g_gate_up.io, 0, g_gate_up.dev_in[0], h_sz);
-    axclrtEngineSetInputBufferByIndex(g_gate_up.io, 1, dgw, gw_sz);
-    axclrtEngineSetInputBufferByIndex(g_gate_up.io, 2, duw, gw_sz);
-    axclrtEngineSetOutputBufferByIndex(g_gate_up.io, 0, g_gate_up.dev_out[0], o_sz);
-    axclrtEngineSetOutputBufferByIndex(g_gate_up.io, 1, g_gate_up.dev_out[1], o_sz);
+    // pre-bound IO per layer: weights + outputs bound once; only h rebound
+    axclrtEngineIO & guio = g_gate_up.io_by_w0[gate_w->data];
+    if (guio == nullptr) {
+        axclrtEngineCreateIO(g_gate_up.info, &guio);
+        axclrtEngineSetInputBufferByIndex(guio, 1, dgw, gw_sz);
+        axclrtEngineSetInputBufferByIndex(guio, 2, duw, gw_sz);
+        axclrtEngineSetOutputBufferByIndex(guio, 0, g_gate_up.dev_out[0], o_sz);
+        axclrtEngineSetOutputBufferByIndex(guio, 1, g_gate_up.dev_out[1], o_sz);
+    }
+    axclrtEngineSetInputBufferByIndex(guio, 0, g_gate_up.dev_in[0], h_sz);
 
-    if (axclrtEngineExecute(g_gate_up.model, g_gate_up.ectx, 0, g_gate_up.io) != AXCL_SUCC) {
+    if (axclrtEngineExecute(g_gate_up.model, g_gate_up.ectx, 0, guio) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: gate+up engine execute failed\n");
         return false;
     }
@@ -1601,14 +1629,20 @@ static bool axcl_qkv_try_flush() {
         void * dkw = axcl_fused_stage_w(&g_qkv, xqkv_q[1]->src[0], (size_t)1024*1024*4);
         void * dvw = axcl_fused_stage_w(&g_qkv, xqkv_q[2]->src[0], (size_t)1024*1024*4);
         if (dqw && dkw && dvw) {
-            axclrtEngineSetInputBufferByIndex(g_qkv.io, 0, g_qkv.dev_in[0], 1024*4);
-            axclrtEngineSetInputBufferByIndex(g_qkv.io, 1, dqw, (size_t)1024*2048*4);
-            axclrtEngineSetInputBufferByIndex(g_qkv.io, 2, dkw, (size_t)1024*1024*4);
-            axclrtEngineSetInputBufferByIndex(g_qkv.io, 3, dvw, (size_t)1024*1024*4);
-            axclrtEngineSetOutputBufferByIndex(g_qkv.io, 0, g_qkv.dev_out[0], 2048*4);
-            axclrtEngineSetOutputBufferByIndex(g_qkv.io, 1, g_qkv.dev_out[1], 1024*4);
-            axclrtEngineSetOutputBufferByIndex(g_qkv.io, 2, g_qkv.dev_out[2], 1024*4);
-            if (axclrtEngineExecute(g_qkv.model, g_qkv.ectx, 0, g_qkv.io) == AXCL_SUCC) {
+            // pre-bound IO per layer: weights + outputs bound once at
+            // creation; only the activation input is rebound per call
+            axclrtEngineIO & io = g_qkv.io_by_w0[xqkv_q[0]->src[0]->data];
+            if (io == nullptr) {
+                axclrtEngineCreateIO(g_qkv.info, &io);
+                axclrtEngineSetInputBufferByIndex(io, 1, dqw, (size_t)1024*2048*4);
+                axclrtEngineSetInputBufferByIndex(io, 2, dkw, (size_t)1024*1024*4);
+                axclrtEngineSetInputBufferByIndex(io, 3, dvw, (size_t)1024*1024*4);
+                axclrtEngineSetOutputBufferByIndex(io, 0, g_qkv.dev_out[0], 2048*4);
+                axclrtEngineSetOutputBufferByIndex(io, 1, g_qkv.dev_out[1], 1024*4);
+                axclrtEngineSetOutputBufferByIndex(io, 2, g_qkv.dev_out[2], 1024*4);
+            }
+            axclrtEngineSetInputBufferByIndex(io, 0, g_qkv.dev_in[0], 1024*4);
+            if (axclrtEngineExecute(g_qkv.model, g_qkv.ectx, 0, io) == AXCL_SUCC) {
                 axclrtMemcpy(xqkv_q[0]->data, g_qkv.dev_out[0], 2048*4, AXCL_MEMCPY_DEVICE_TO_HOST);
                 axclrtMemcpy(xqkv_q[1]->data, g_qkv.dev_out[1], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
                 axclrtMemcpy(xqkv_q[2]->data, g_qkv.dev_out[2], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
@@ -2367,6 +2401,14 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
     // K/V views. GGML_AXCL_UNIVERSAL=2: claim all COMPUTE ops but leave
     // metadata on the CPU — eliminates splits between our compute ops while
     // avoiding the metadata split-copy hazard.
+    // vocab-sized projections stay on CPU: dequantizing to f32 and shipping
+    // 622MB/token dominates NPU DRAM bandwidth; the CPU's native Q8_0 GEMV
+    // does it with no transfer (GGML_AXCL_NPU_VOCAB=1 to override)
+    static const char * npu_vocab_env = getenv("GGML_AXCL_NPU_VOCAB");
+    if (npu_vocab_env == nullptr && op->op == GGML_OP_MUL_MAT &&
+        op->src[0] != nullptr && op->src[0]->ne[1] > 32768) {
+        return false;
+    }
     static const char * uni_env = getenv("GGML_AXCL_UNIVERSAL");
     if (uni_env != nullptr && uni_env[0] == '2') {
         switch (op->op) {
