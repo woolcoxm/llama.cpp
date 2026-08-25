@@ -422,12 +422,15 @@ static void axcl_attn_load() {
     const char * env = getenv("AXCL_ATTN_MODEL");
     const char * path = env ? env : "/usr/local/share/ggml-axcl/attn_h16_d128_t512.axmodel";
     FILE * f = fopen(path, "r");
-    if (!f) return;
+    if (!f) { fprintf(stderr, "[axcl-attn] file not found: %s\n", path); return; }
     fclose(f);
-    if (axclrtEngineLoadFromFile(path, &g_attn.model) != AXCL_SUCC) {
+    axclError le = axclrtEngineLoadFromFile(path, &g_attn.model);
+    if (le != AXCL_SUCC) {
+        fprintf(stderr, "[axcl-attn] load failed: %d for %s\n", (int) le, path);
         g_attn.model = 0;
         return;
     }
+    fprintf(stderr, "[axcl-attn] loaded model=%llx\n", (unsigned long long) g_attn.model);
     axclrtEngineGetIOInfo(g_attn.model, &g_attn.info);
     axclrtEngineCreateIO(g_attn.info, &g_attn.io);
     axclrtEngineCreateContext(g_attn.model, &g_attn.ectx);
@@ -1256,7 +1259,9 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT failed\n", i);
                     return GGML_STATUS_ABORTED;
                 }
-            } else if (g_attn.model != 0 && src1->ne[1] == 1 && src0->ne[2] == 1) {
+            } else {
+                fprintf(stderr, "[axcl-unmatched] k=%lld n=%lld\n",
+                        (long long) src0->ne[0], (long long) src0->ne[1]);
                 // attention matmuls have dynamic shapes (seq grows per token)
                 // q@k: ne[0]=1024(KV dim, fixed), ne[1]=seq(dynamic) — buffer and skip
                 // @v:   ne[0]=seq(dynamic), ne[1]=1024(fixed) — call engine
@@ -1295,21 +1300,9 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     d[nn] = acc;
                 }
                 prof_hostops++;
-            } else {
-                // non-attention small matmul: scalar fallback
-                const int64_t k = src0->ne[0], n = src0->ne[1];
-                const float * x = (const float *) src1->data;
-                float *       d = (float *) node->data;
-                for (int64_t nn = 0; nn < n; nn++) {
-                    const float * w = (const float *) ((const char *) src0->data + (size_t) nn * src0->nb[1]);
-                    float acc = 0.0f;
-                    for (int64_t kk = 0; kk < k; kk++) acc += w[kk] * x[kk];
-                    d[nn] = acc;
-                }
-                prof_hostops++;
             }
         } else {
-            fprintf(stderr, "[axcl-dbg] node %d op %s NOT SUPPORTED\n", i, ggml_op_name(node->op));
+            fprintf(stderr, "[axcl-unsupported] node %d op %s\n", i, ggml_op_name(node->op));
             GGML_LOG_ERROR("ggml-axcl: node %d op %s not supported\n", i, ggml_op_name(node->op));
             return GGML_STATUS_ABORTED;
         }
@@ -1497,9 +1490,11 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_DUP:
             return op->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:
-            // embedding lookup from weights living in our buffer; without
-            // accepting it the scheduler aborts (no backend pairs our buft
-            // with this op)
+        case GGML_OP_ROPE:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_DIAG_MASK_INF:
+            // accepting these keeps the attention block in our splits
+            // (scheduler groups attention with rope/kv-write ops)
             return true;
         default:
             break;
