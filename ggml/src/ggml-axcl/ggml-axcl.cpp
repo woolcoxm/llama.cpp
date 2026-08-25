@@ -24,9 +24,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unordered_set>
 #include <chrono>
 #include <mutex>
+#include <atomic>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -390,24 +393,19 @@ static void axcl_fused_alloc(axcl_fused_engine * fe,
         axclrtMalloc(&fe->dev_out[i], out_sizes[i], AXCL_MEM_MALLOC_HUGE_FIRST);
 }
 
-// stage a weight tensor (dequant to f32 if needed, upload once)
+// stage a weight tensor once: dequant to f32 AND transpose to the engine's
+// [k, n] layout (the raw ggml layout is row-per-output [n, k] — uploading it
+// untransposed silently scrambles the projection)
+static void axcl_dequant_any_to_f32_transposed(const struct ggml_tensor * t, float * w32);
 static void * axcl_fused_stage_w(axcl_fused_engine * fe, const struct ggml_tensor * w, size_t bytes) {
     auto it = fe->staged_w.find(w->data);
     if (it != fe->staged_w.end()) return it->second;
     void * dev = nullptr;
     axclrtMalloc(&dev, bytes, AXCL_MEM_MALLOC_HUGE_FIRST);
     if (dev == nullptr) return nullptr;
-    if (w->type == GGML_TYPE_F32) {
-        axclrtMemcpy(dev, w->data, bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
-    } else {
-        fe->scratch.resize(bytes / 4);
-        const auto * tr = ggml_get_type_traits(w->type);
-        if (tr && tr->to_float) {
-            const int64_t total = w->ne[0] * w->ne[1];
-            tr->to_float(w->data, fe->scratch.data(), total);
-            axclrtMemcpy(dev, fe->scratch.data(), bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
-        }
-    }
+    fe->scratch.resize(bytes / 4);
+    axcl_dequant_any_to_f32_transposed(w, fe->scratch.data());
+    axclrtMemcpy(dev, fe->scratch.data(), bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
     fe->staged_w[w->data] = dev;
     return dev;
 }
@@ -418,10 +416,21 @@ struct axcl_attn_engine {
     uint64_t model = 0, ectx = 0;
     axclrtEngineIOInfo info = nullptr;
     axclrtEngineIO     io   = nullptr;
-    void * dq = nullptr, * dk = nullptr, * dv = nullptr, * dm = nullptr, * dout = nullptr;
+    void * dq = nullptr, * dm = nullptr, * dout = nullptr;
     int iq = -1, ik = -1, iv = -1, im = -1, iout = -1;
     int h_q = 16, h_kv = 8, d = 128, t = 32;
     std::vector<float> q_buf, k_buf, v_buf, m_buf, out_buf; // host staging
+    // device-resident KV cache: one buffer pair per layer, keyed by the host
+    // cache pointers. wm = tokens already on the device; decode is append-only
+    // per layer, so each step ships only the new token's slice instead of the
+    // whole zero-padded [HQ, T, D] tensor (~8 MB/layer at T=512).
+    struct kv_slot {
+        const void * kptr = nullptr, * vptr = nullptr;
+        void * dk = nullptr, * dv = nullptr;
+        int wm = 0;
+    };
+    kv_slot kv[128];
+    int kv_n = 0;
 };
 static axcl_attn_engine g_attn;
 static axcl_fused_engine g_qkv;   // rms_norm + q/k/v projections
@@ -434,6 +443,14 @@ static void axcl_attn_load() {
     FILE * f = fopen(path, "r");
     if (!f) return;
     fclose(f);
+    // engine context length from the filename (..._t512.axmodel); default 32
+    for (const char * p = strstr(path, "_t"); p != nullptr; p = strstr(p + 1, "_t")) {
+        if (p[2] >= '0' && p[2] <= '9') {
+            const int tv = atoi(p + 2);
+            if (tv > 0) g_attn.t = tv;
+            break;
+        }
+    }
     if (axclrtEngineLoadFromFile(path, &g_attn.model) != AXCL_SUCC) {
         g_attn.model = 0;
         return;
@@ -450,8 +467,6 @@ static void axcl_attn_load() {
 
     const int HQ = g_attn.h_q, D = g_attn.d, T = g_attn.t;
     axclrtMalloc(&g_attn.dq,   HQ * D * 4, AXCL_MEM_MALLOC_HUGE_FIRST);
-    axclrtMalloc(&g_attn.dk, (size_t) HQ * T * D * 4, AXCL_MEM_MALLOC_HUGE_FIRST);
-    axclrtMalloc(&g_attn.dv, (size_t) HQ * T * D * 4, AXCL_MEM_MALLOC_HUGE_FIRST);
     axclrtMalloc(&g_attn.dm,   T * 4, AXCL_MEM_MALLOC_HUGE_FIRST);
     axclrtMalloc(&g_attn.dout, HQ * D * 4, AXCL_MEM_MALLOC_HUGE_FIRST);
     g_attn.q_buf.resize(HQ * D);
@@ -462,46 +477,107 @@ static void axcl_attn_load() {
     GGML_LOG_INFO("ggml-axcl: attention engine loaded (%s)\n", path);
 }
 
-// run one fused attention call: repack + upload + execute + download
-static bool axcl_attn_run(const float * q, const float * k_cache, const float * v_cache,
-                          size_t k_nb1, size_t v_nb1, int seq, int n_kv_heads, int head_dim,
+// fetch D consecutive elements of a cache row in the cache's element type
+static inline void axcl_kv_fetch(const void * row, ggml_type ty, float * dst, int d_elems) {
+    if (ty == GGML_TYPE_F32) {
+        memcpy(dst, row, (size_t) d_elems * 4);
+    } else if (ty == GGML_TYPE_F16) {
+        const ggml_fp16_t * h = (const ggml_fp16_t *) row;
+        for (int i = 0; i < d_elems; i++) dst[i] = GGML_COMPUTE_FP16_TO_FP32(h[i]);
+    } else if (ty == GGML_TYPE_BF16) {
+        const uint16_t * h = (const uint16_t *) row;
+        for (int i = 0; i < d_elems; i++) {
+            uint32_t u = (uint32_t) h[i] << 16;
+            memcpy(&dst[i], &u, 4);
+        }
+    }
+}
+
+// incremental KV residency: append-only upload per layer, returns the layer's
+// device K/V buffers. A rewind (seq < wm, e.g. context shift) forces a full
+// re-upload. Assumes single-sequence decode; multi-slot serving would need
+// per-sequence watermarks.
+static bool axcl_attn_sync_kv(const void * k_base, const void * v_base,
+                              size_t k_nb1, size_t v_nb1, ggml_type k_ty, ggml_type v_ty,
+                              int seq, int n_kv_heads,
+                              void ** dk, void ** dv) {
+    const int HQ = g_attn.h_q, D = g_attn.d, T = g_attn.t;
+    const int G = HQ / n_kv_heads;
+    const size_t k_es = ggml_type_size(k_ty), v_es = ggml_type_size(v_ty);
+    int s = -1;
+    for (int i = 0; i < g_attn.kv_n; i++) {
+        if (g_attn.kv[i].kptr == k_base && g_attn.kv[i].vptr == v_base) { s = i; break; }
+    }
+    if (s < 0) {
+        if (g_attn.kv_n >= (int) (sizeof(g_attn.kv) / sizeof(g_attn.kv[0]))) return false;
+        s = g_attn.kv_n++;
+        g_attn.kv[s].kptr = k_base;
+        g_attn.kv[s].vptr = v_base;
+        const size_t bytes = (size_t) HQ * T * D * 4;
+        if (axclrtMalloc(&g_attn.kv[s].dk, bytes, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            axclrtMalloc(&g_attn.kv[s].dv, bytes, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC) {
+            GGML_LOG_ERROR("ggml-axcl: KV residency alloc failed (%zu MB/side)\n", bytes >> 20);
+            g_attn.kv_n--;
+            return false;
+        }
+        // zero-fill once so the padded tail [seq, T) never contains stale data
+        memset(g_attn.k_buf.data(), 0, g_attn.k_buf.size() * 4);
+        memset(g_attn.v_buf.data(), 0, g_attn.v_buf.size() * 4);
+        axclrtMemcpy(g_attn.kv[s].dk, g_attn.k_buf.data(), bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
+        axclrtMemcpy(g_attn.kv[s].dv, g_attn.v_buf.data(), bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
+    }
+    int wm = g_attn.kv[s].wm;
+    if (seq < wm) wm = 0;
+    if (seq > wm) {
+        for (int h = 0; h < HQ; h++) {
+            const int hk = h / G;
+            float * kd = &g_attn.k_buf[((size_t) h * T + wm) * D];
+            float * vd = &g_attn.v_buf[((size_t) h * T + wm) * D];
+            for (int t = wm; t < seq; t++) {
+                axcl_kv_fetch((const char *) k_base + (size_t)(hk * D) * k_es + (size_t) t * k_nb1, k_ty, kd, D);
+                axcl_kv_fetch((const char *) v_base + (size_t)(hk * D) * v_es + (size_t) t * v_nb1, v_ty, vd, D);
+                kd += D; vd += D;
+            }
+        }
+        const size_t bytes = (size_t)(seq - wm) * D * 4;
+        for (int h = 0; h < HQ; h++) {
+            axclrtMemcpy((char *) g_attn.kv[s].dk + ((size_t) h * T + wm) * D * 4,
+                         &g_attn.k_buf[((size_t) h * T + wm) * D], bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
+            axclrtMemcpy((char *) g_attn.kv[s].dv + ((size_t) h * T + wm) * D * 4,
+                         &g_attn.v_buf[((size_t) h * T + wm) * D], bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
+        }
+        g_attn.kv[s].wm = seq;
+    }
+    *dk = g_attn.kv[s].dk;
+    *dv = g_attn.kv[s].dv;
+    return true;
+}
+
+// run one fused attention call: incremental KV upload + execute + download
+static bool axcl_attn_run(const float * q, const void * k_cache, const void * v_cache,
+                          size_t k_nb1, size_t v_nb1, ggml_type k_ty, ggml_type v_ty,
+                          int seq, int n_kv_heads, int head_dim,
                           float * out) {
     if (g_attn.model == 0) return false;
     const int HQ = g_attn.h_q, D = g_attn.d, T = g_attn.t;
-    const int G = HQ / n_kv_heads;
     if ((int) head_dim != D || seq > T) return false;
+
+    void * dk = nullptr, * dv = nullptr;
+    if (!axcl_attn_sync_kv(k_cache, v_cache, k_nb1, v_nb1, k_ty, v_ty, seq, n_kv_heads, &dk, &dv)) return false;
 
     // repack Q: [n_embd] -> [HQ, D] (identity reshape)
     memcpy(g_attn.q_buf.data(), q, (size_t) HQ * D * 4);
 
-    // repack K/V: from cache [n_kv_heads*D, n_ctx] to [HQ, T, D] with GQA repeat
-    for (int h = 0; h < HQ; h++) {
-        int hk = h / G;
-        for (int t = 0; t < T; t++) {
-            if (t < seq) {
-                const char * ksrc = (const char *) k_cache + (size_t) (hk * D) * 4 + (size_t) t * k_nb1;
-                const char * vsrc = (const char *) v_cache + (size_t) (hk * D) * 4 + (size_t) t * v_nb1;
-                memcpy(&g_attn.k_buf[((size_t) h * T + t) * D], ksrc, (size_t) D * 4);
-                memcpy(&g_attn.v_buf[((size_t) h * T + t) * D], vsrc, (size_t) D * 4);
-            } else {
-                memset(&g_attn.k_buf[((size_t) h * T + t) * D], 0, (size_t) D * 4);
-                memset(&g_attn.v_buf[((size_t) h * T + t) * D], 0, (size_t) D * 4);
-            }
-        }
-    }
-
     // mask: 0 for valid, -1e9 beyond
     for (int t = 0; t < T; t++) g_attn.m_buf[t] = (t < seq) ? 0.0f : -1e9f;
 
-    // upload + execute + download
     axclrtMemcpy(g_attn.dq, g_attn.q_buf.data(), (size_t) HQ * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-    axclrtMemcpy(g_attn.dk, g_attn.k_buf.data(), (size_t) HQ * T * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-    axclrtMemcpy(g_attn.dv, g_attn.v_buf.data(), (size_t) HQ * T * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
     axclrtMemcpy(g_attn.dm, g_attn.m_buf.data(), T * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
 
+    const size_t kv_bytes = (size_t) HQ * T * D * 4;
     axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iq, g_attn.dq, (size_t) HQ * D * 4);
-    axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.ik, g_attn.dk, (size_t) HQ * T * D * 4);
-    axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iv, g_attn.dv, (size_t) HQ * T * D * 4);
+    axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.ik, dk, kv_bytes);
+    axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iv, dv, kv_bytes);
     axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.im, g_attn.dm, T * 4);
     axclrtEngineSetOutputBufferByIndex(g_attn.io, g_attn.iout, g_attn.dout, (size_t) HQ * D * 4);
 
@@ -557,6 +633,19 @@ static bool axcl_engine_global_init() {
             GGML_LOG_ERROR("ggml-axcl: engine activation failed with %d\n", (int) err);
         }
         initialized = true;
+        if (available) {
+            // the runtime logs every context/device bind at INFO — silence it
+            // (it fires per graph compute and costs real time)
+            axclSetLogLevel(3); // warnings and above
+            // axcl_rt keeps worker threads alive past main(); without an
+            // explicit finalize they throw during exit handling. atexit runs
+            // before library teardown, so the runtime is still fully up here.
+            atexit([]() {
+                axclrtSetCurrentContext(g_axcl_ctx);
+                axclrtEngineFinalize();
+                axclFinalize();
+            });
+        }
     }
     return available;
 }
@@ -756,8 +845,14 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
     const int64_t k = mm->k;
     const int64_t n = mm->n;
 
-    // X: activation, src1 is [K, 1] f32 contiguous
-    memcpy(mm->x_h.data(), src1->data, (size_t) k * 4);
+    // X: activation, src1 is [K, 1] f32 — may be a strided view (permuted
+    // attention tensors), so read element-wise unless contiguous
+    if (src1->nb[0] == 4) {
+        memcpy(mm->x_h.data(), src1->data, (size_t) k * 4);
+    } else {
+        for (int64_t kk = 0; kk < k; kk++)
+            mm->x_h[kk] = *(const float *) ((const char *) src1->data + (size_t) kk * src1->nb[0]);
+    }
 
     // W: card-resident when staged, else one-time staging into the pool
     void * dw = nullptr;
@@ -901,30 +996,31 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
         }
         case GGML_OP_ADD:
         case GGML_OP_MUL: {
+            // exact CPU semantics: per-dim broadcast (i_k % src->ne[k]), f32
             const bool mul = (node->op == GGML_OP_MUL);
-            // scalar broadcast or same-shape (the only shapes in our splits)
-            const int64_t ne = ggml_nbytes(node) / 4; // f32 contiguous fast path
-            // flat fast path only when BOTH tensors have the same total size
-            // (broadcast [128,1,1] × [128,16,9] would overread src1)
-            const bool same = src0->nb[0] == 4 && src1->nb[0] == 4 &&
-                              ggml_nbytes(src1) >= ggml_nbytes(node) &&
-                              src0->ne[0] == src1->ne[0];
-            if (same && src0->nb[1] == (size_t) ne0 * 4 && node->nb[1] == (size_t) ne0 * 4 &&
-                (src1->ne[1] == node->ne[1] || src1->ne[0] * src1->ne[1] == 1)) {
-                const float * a = (const float *) src0->data;
-                const float * b = (const float *) src1->data;
-                const bool scalar = (src1->ne[0] * src1->ne[1] == 1);
-                for (int64_t i = 0; i < ne; i++) {
-                    dst[i] = mul ? a[i] * (scalar ? b[0] : b[i]) : a[i] + (scalar ? b[0] : b[i]);
-                }
-            } else {
-                for (int64_t r = 0; r < nr; r++) {
-                    const float * a = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
-                    const float * b = (const float *) ((char *) src1->data + axcl_row_off(src1, r % (src1->ne[1] * src1->ne[2] * src1->ne[3])));
-                    float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
-                    for (int64_t i = 0; i < ne0; i++) {
-                        float bv = (src1->ne[0] == 1) ? b[0] : b[i];
-                        dr[i] = mul ? a[i] * bv : a[i] + bv;
+            const int64_t n1 = node->ne[1], n2 = node->ne[2] ? node->ne[2] : 1, n3 = node->ne[3] ? node->ne[3] : 1;
+            const int64_t a1 = src0->ne[1] ? src0->ne[1] : 1, a2 = src0->ne[2] ? src0->ne[2] : 1, a3 = src0->ne[3] ? src0->ne[3] : 1;
+            const int64_t b1 = src1->ne[1] ? src1->ne[1] : 1, b2 = src1->ne[2] ? src1->ne[2] : 1, b3 = src1->ne[3] ? src1->ne[3] : 1;
+            const bool bscalar = (src1->ne[0] == 1 && b1 * b2 * b3 == 1);
+            for (int64_t j3 = 0; j3 < n3; j3++) {
+                for (int64_t j2 = 0; j2 < n2; j2++) {
+                    for (int64_t j1 = 0; j1 < n1; j1++) {
+                        const float * a = (const float *) ((char *) src0->data +
+                            (size_t)(j1 % a1) * src0->nb[1] + (size_t)(j2 % a2) * src0->nb[2] + (size_t)(j3 % a3) * src0->nb[3]);
+                        const float * b = (const float *) ((char *) src1->data +
+                            (size_t)(j1 % b1) * src1->nb[1] + (size_t)(j2 % b2) * src1->nb[2] + (size_t)(j3 % b3) * src1->nb[3]);
+                        float * dr = (float *) ((char *) node->data +
+                            (size_t)j1 * node->nb[1] + (size_t)j2 * node->nb[2] + (size_t)j3 * node->nb[3]);
+                        if (bscalar) {
+                            const float bv = b[0];
+                            if (mul) { for (int64_t i = 0; i < ne0; i++) dr[i] = a[i] * bv; }
+                            else     { for (int64_t i = 0; i < ne0; i++) dr[i] = a[i] + bv; }
+                        } else if (src1->ne[0] == 1) {
+                            for (int64_t i = 0; i < ne0; i++) dr[i] = mul ? a[i] * b[0] : a[i] + b[0];
+                        } else {
+                            if (mul) { for (int64_t i = 0; i < ne0; i++) dr[i] = a[i] * b[i]; }
+                            else     { for (int64_t i = 0; i < ne0; i++) dr[i] = a[i] + b[i]; }
+                        }
                     }
                 }
             }
@@ -955,220 +1051,90 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             float params[2] = {1.0f, 0.0f};
             memcpy(params, node->op_params, sizeof(params));
             const float scale = params[0];
+            // optional additive mask (src1): f16/f32, broadcast over rows or
+            // one row per outer row — required for causal manual attention
+            const struct ggml_tensor * ms = src1;
+            const int64_t mrows = ms ? (ms->ne[1] * ms->ne[2] * ms->ne[3]) : 0;
             for (int64_t r = 0; r < nr; r++) {
                 const float * x = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
                 float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
+                const char * mrow = (ms && mrows > 0)
+                    ? (const char *) ms->data + axcl_row_off(ms, mrows > 1 ? (r % mrows) : 0) : nullptr;
                 float mx = -INFINITY;
-                for (int64_t i = 0; i < ne0; i++) mx = fmaxf(mx, x[i] * scale);
+                for (int64_t i = 0; i < ne0; i++) {
+                    float v = x[i] * scale;
+                    if (mrow) {
+                        v += (ms->type == GGML_TYPE_F16)
+                            ? GGML_COMPUTE_FP16_TO_FP32(((const ggml_fp16_t *) mrow)[i])
+                            : ((const float *) mrow)[i];
+                    }
+                    mx = fmaxf(mx, v);
+                }
                 float sum = 0.0f;
-                for (int64_t i = 0; i < ne0; i++) { dr[i] = expf(x[i] * scale - mx); sum += dr[i]; }
+                for (int64_t i = 0; i < ne0; i++) {
+                    float v = x[i] * scale;
+                    if (mrow) {
+                        v += (ms->type == GGML_TYPE_F16)
+                            ? GGML_COMPUTE_FP16_TO_FP32(((const ggml_fp16_t *) mrow)[i])
+                            : ((const float *) mrow)[i];
+                    }
+                    dr[i] = expf(v - mx);
+                    sum += dr[i];
+                }
                 float inv = 1.0f / sum;
                 for (int64_t i = 0; i < ne0; i++) dr[i] *= inv;
             }
             break;
         }
         case GGML_OP_SCALE: {
-            float v;
-            memcpy(&v, node->op_params, sizeof(v));
+            // op_params: [0]=scale, [1]=bias; dst = src*scale + bias
+            float sb[2] = {1.0f, 0.0f};
+            memcpy(sb, node->op_params, sizeof(sb));
             for (int64_t r = 0; r < nr; r++) {
                 const float * x = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
                 float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
-                for (int64_t i = 0; i < ne0; i++) dr[i] = x[i] * v;
+                for (int64_t i = 0; i < ne0; i++) dr[i] = x[i] * sb[0] + sb[1];
             }
             break;
         }
         case GGML_OP_CPY:
-        case GGML_OP_DUP: {
-            // same-layout f32 copy (fast path contiguous)
-            const int64_t ne = ggml_nbytes(node) / 4;
-            if (src0->nb[0] == 4 && node->nb[0] == 4 &&
-                (nr <= 1 || (src0->nb[1] == (size_t) ne0 * 4 && node->nb[1] == (size_t) ne0 * 4))) {
-                memcpy(node->data, src0->data, (size_t) ne * 4);
-            } else {
-                for (int64_t r = 0; r < nr; r++) {
-                    const float * x = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
-                    float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
-                    for (int64_t i = 0; i < ne0; i++) dr[i] = x[i];
-                }
-            }
-            break;
-        }
-        case GGML_OP_GET_ROWS: {
-            // out[r, :] = rows(src0)[ src1[r] ] (dequant if needed)
-            const int64_t nrq = node->ne[1];
-            const int64_t nc  = src0->ne[0];
-            const struct ggml_type_traits * tr = ggml_get_type_traits(src0->type);
-            std::vector<float> rowbuf(nc);
-            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 &&
-                src0->type != GGML_TYPE_BF16) {
-                GGML_ASSERT(tr && tr->to_float);
-            }
-            for (int64_t r = 0; r < nrq; r++) {
-                int64_t id;
-                if (src1->type == GGML_TYPE_I32) {
-                    id = (int64_t) ((const int32_t *) ((const char *) src1->data + (size_t) r * src1->nb[1]))[0];
-                } else {
-                    id = ((const int64_t *) ((const char *) src1->data + (size_t) r * src1->nb[1]))[0];
-                }
-                // views index beyond the view's row count into the parent
-                // (KV cache): address via nb[1] like the CPU kernel, no
-                // bounds check on ne[1]
-                const void * srcrow = (const char *) src0->data + (size_t) id * src0->nb[1];
-                float * drow = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
-                if (src0->type == GGML_TYPE_F32) {
-                    memcpy(drow, srcrow, (size_t) nc * 4);
-                } else if (src0->type == GGML_TYPE_F16) {
-                    const ggml_fp16_t * h = (const ggml_fp16_t *) srcrow;
-                    for (int64_t i = 0; i < nc; i++) drow[i] = GGML_COMPUTE_FP16_TO_FP32(h[i]);
-                } else if (src0->type == GGML_TYPE_BF16) {
-                    const uint16_t * h = (const uint16_t *) srcrow;
-                    for (int64_t i = 0; i < nc; i++) {
-                        uint32_t u = (uint32_t) h[i] << 16;
-                        memcpy(&drow[i], &u, 4);
-                    }
-                } else {
-                    tr->to_float(srcrow, rowbuf.data(), nc);
-                    memcpy(drow, rowbuf.data(), (size_t) nc * 4);
-                }
-            }
-            break;
-        }
-        case GGML_OP_ROPE: {
-            float freq_base = 10000.0f;
-            memcpy(&freq_base, (char *) node->op_params + 8, sizeof(float));
-            const int64_t hd = src0->ne[0];
-            const int64_t half = hd / 2;
-            const int64_t nrows = ggml_nrows(node);
-            int32_t pos = 0;
-            if (src1 != nullptr && src1->type == GGML_TYPE_I32 && src1->ne[0] > 0) {
-                memcpy(&pos, src1->data, sizeof(int32_t));
-            }
-            for (int64_t r = 0; r < nrows; r++) {
-                const float * x = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
-                float * dr = (float *) ((char *) node->data + axcl_row_off(node, r));
-                for (int64_t i = 0; i < half; i++) {
-                    float theta = powf(freq_base, (float)(-2.0 * i / hd));
-                    float cv = cosf(pos * theta), sv = sinf(pos * theta);
-                    float x0 = x[i], x1 = x[i + half];
-                    dr[i] = x0 * cv - x1 * sv;
-                    dr[i + half] = x0 * sv + x1 * cv;
-                }
-            }
-            break;
-        }
-        case GGML_OP_SET_ROWS: {
-            if (!src0 || !src0->data || !node || !node->data || !src1 || !src1->data) break;
-            const struct ggml_tensor * ids = src1;
-            const int64_t nc = src0->ne[0];
-            const int64_t nr = ggml_nrows(src0);
-            const size_t node_bytes = ggml_nbytes(node);
-            for (int64_t r = 0; r < nr; r++) {
-                int64_t id = 0;
-                if (ids->type == GGML_TYPE_I32) {
-                    id = *(const int32_t *)((const char *)ids->data + (size_t)r * ids->nb[0]);
-                } else if (ids->type == GGML_TYPE_I64) {
-                    id = *(const int64_t *)((const char *)ids->data + (size_t)r * ids->nb[0]);
-                }
-                if (id < 0 || (size_t)((size_t)id * node->nb[1] + (size_t)nc * 4) > node_bytes) continue;
-                size_t sr_off = axcl_row_off(src0, r);
-                if (sr_off + (size_t)nc * 4 > ggml_nbytes(src0)) continue;
-                const float * sr = (const float *)((char *)src0->data + sr_off);
-                char * drow = (char *)node->data + (size_t)id * node->nb[1];
-                size_t remain = node_bytes - (size_t)(drow - (char *)node->data);
-                size_t cp = (size_t)nc * 4;
-                if (cp > remain) cp = remain;
-                if (cp > 0) memcpy(drow, sr, cp);
-            }
-            break;
-        }
-        case GGML_OP_FLASH_ATTN_EXT: {
-            // flash attention: src0=Q [hd,1,H,1], src1=K [hd,seq,HKV,1], src2=V [seq,hd,HKV,1]
-            // route to our fused attention engine with 3D→flat repacking
-            if (g_attn.model == 0 || !src0 || !src1 || !node->src[2]) return false;
-            const struct ggml_tensor * qt = src0;
-            const struct ggml_tensor * kt = src1;
-            const struct ggml_tensor * vt = node->src[2];
-            const int HQ = 16, D = 128, HKV = 8, G = HQ / HKV;
-            if (qt->ne[0] != D || kt->ne[2] != HKV) return false; // wrong head config
-            const int seq = (int) kt->ne[1];
-            if (seq > g_attn.t) return false; // context too long for engine
-
-            // repack Q: [D, 1, HQ, 1] → engine [HQ, D]
-            // head h at offset h*qt->nb[2], elem d at d*qt->nb[0] → engine_Q[h*D+d]
-            static float eq[HQ * D];
-            for (int h = 0; h < HQ; h++)
-                for (int d = 0; d < D; d++)
-                    eq[h * D + d] = *(const float *)((const char *)qt->data + (size_t)d * qt->nb[0] + (size_t)h * qt->nb[2]);
-
-            // repack K: [D, seq, HKV, 1] → engine [HQ, T, D] with GQA repeat
-            // cache[d, t, kv_h] → engine_K[h, t, d] where kv_h = h/G
-            static std::vector<float> ek, ev;
-            ek.resize((size_t) HQ * g_attn.t * D);
-            ev.resize((size_t) HQ * g_attn.t * D);
-            for (int h = 0; h < HQ; h++) {
-                int hk = h / G;
-                for (int t = 0; t < g_attn.t; t++) {
-                    float * kd = &ek[((size_t)h * g_attn.t + t) * D];
-                    float * vd = &ev[((size_t)h * g_attn.t + t) * D];
-                    if (t < seq) {
-                        for (int d = 0; d < D; d++) {
-                            kd[d] = *(const float *)((const char *)kt->data +
-                                (size_t)d * kt->nb[0] + (size_t)t * kt->nb[1] + (size_t)hk * kt->nb[2]);
-                            // V is [seq, hd, HKV, 1]: v[t, d, hk]
-                            vd[d] = *(const float *)((const char *)vt->data +
-                                (size_t)t * vt->nb[0] + (size_t)d * vt->nb[1] + (size_t)hk * vt->nb[2]);
-                        }
-                    } else {
-                        memset(kd, 0, D * 4);
-                        memset(vd, 0, D * 4);
-                    }
-                }
-            }
-
-            // upload + execute
-            axclrtMemcpy(g_attn.dq, eq, (size_t)HQ * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-            axclrtMemcpy(g_attn.dk, ek.data(), (size_t)HQ * g_attn.t * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-            axclrtMemcpy(g_attn.dv, ev.data(), (size_t)HQ * g_attn.t * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-            // mask: 0 for valid, -1e9 beyond
-            for (int t = 0; t < g_attn.t; t++) g_attn.m_buf[t] = (t < seq) ? 0.0f : -1e9f;
-            axclrtMemcpy(g_attn.dm, g_attn.m_buf.data(), g_attn.t * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iq, g_attn.dq, (size_t)HQ * D * 4);
-            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.ik, g_attn.dk, (size_t)HQ * g_attn.t * D * 4);
-            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iv, g_attn.dv, (size_t)HQ * g_attn.t * D * 4);
-            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.im, g_attn.dm, g_attn.t * 4);
-            axclrtEngineSetOutputBufferByIndex(g_attn.io, g_attn.iout, g_attn.dout, (size_t)HQ * D * 4);
-            if (axclrtEngineExecute(g_attn.model, g_attn.ectx, 0, g_attn.io) != AXCL_SUCC) {
-                GGML_LOG_ERROR("ggml-axcl: attention engine execute failed\\n");
-                return false;
-            }
-            axclrtMemcpy(g_attn.out_buf.data(), g_attn.dout, (size_t)HQ * D * 4, AXCL_MEMCPY_DEVICE_TO_HOST);
-
-            // unpack: engine [HQ, D] → node [D, 1, HQ, 1]
-            for (int h = 0; h < HQ; h++)
-                for (int d = 0; d < D; d++)
-                    *(float *)((char *)node->data + (size_t)d * node->nb[0] + (size_t)h * node->nb[2]) =
-                        g_attn.out_buf[h * D + d];
-            break;
-        }
+        case GGML_OP_DUP:
         case GGML_OP_CONT: {
-            // stride-aware contiguous copy: src0 may be a permuted/transposed view
-            // (raw memcpy would read wrong data from non-contiguous layouts)
+            // stride-aware copy with type conversion (CPU dup semantics):
+            // rows may be views with arbitrary strides, element sizes differ
             if (!src0 || !src0->data || !node->data) break;
-            const int64_t ne0 = node->ne[0], ne1 = node->ne[1];
-            const int64_t ne2 = node->ne[2], ne3 = node->ne[3];
-            for (int64_t j3 = 0; j3 < ne3; j3++) {
-                for (int64_t j2 = 0; j2 < ne2; j2++) {
-                    for (int64_t j1 = 0; j1 < ne1; j1++) {
+            const ggml_type sty = src0->type, dty = node->type;
+            const size_t des = ggml_type_size(dty);
+            const bool f32tof32 = (sty == GGML_TYPE_F32 && dty == GGML_TYPE_F32);
+            for (int64_t j3 = 0; j3 < node->ne[3]; j3++) {
+                for (int64_t j2 = 0; j2 < node->ne[2]; j2++) {
+                    for (int64_t j1 = 0; j1 < node->ne[1]; j1++) {
                         const char * s = (const char *) src0->data +
                             (size_t)j1 * src0->nb[1] + (size_t)j2 * src0->nb[2] + (size_t)j3 * src0->nb[3];
                         char * d = (char *) node->data +
                             (size_t)j1 * node->nb[1] + (size_t)j2 * node->nb[2] + (size_t)j3 * node->nb[3];
-                        // inner row: ne0 elements with stride nb[0]
-                        if (src0->nb[0] == 4) {
-                            memcpy(d, s, (size_t) ne0 * 4);
+                        if (sty == dty && src0->nb[0] == des && node->nb[0] == des) {
+                            memcpy(d, s, (size_t) ne0 * des);
+                        } else if (f32tof32) {
+                            for (int64_t i = 0; i < ne0; i++)
+                                *(float *)(d + i * 4) = *(const float *)(s + i * src0->nb[0]);
                         } else {
-                            for (int64_t j0 = 0; j0 < ne0; j0++) {
-                                memcpy(d + j0 * 4, s + j0 * src0->nb[0], 4);
+                            float buf[2048];
+                            for (int64_t i0 = 0; i0 < ne0; i0 += 2048) {
+                                const int64_t n = (ne0 - i0 < 2048) ? (ne0 - i0) : 2048;
+                                axcl_kv_fetch(s + (size_t)i0 * src0->nb[0], sty, buf, (int) n);
+                                if (dty == GGML_TYPE_F32) {
+                                    memcpy(d + (size_t)i0 * 4, buf, (size_t)n * 4);
+                                } else if (dty == GGML_TYPE_F16) {
+                                    ggml_fp16_t * h = (ggml_fp16_t *)(d + (size_t)i0 * 2);
+                                    for (int64_t i = 0; i < n; i++) h[i] = GGML_COMPUTE_FP32_TO_FP16(buf[i]);
+                                } else if (dty == GGML_TYPE_BF16) {
+                                    uint16_t * h = (uint16_t *)(d + (size_t)i0 * 2);
+                                    for (int64_t i = 0; i < n; i++) {
+                                        uint32_t u; memcpy(&u, &buf[i], 4);
+                                        h[i] = (uint16_t)(u >> 16);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1176,18 +1142,231 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             }
             break;
         }
+        case GGML_OP_GET_ROWS: {
+            // CPU semantics: ids decompose as (i10,i11,i12); the id's outer
+            // dims map into BOTH the destination and the source rows
+            const int64_t nc  = src0->ne[0];
+            const int64_t nrid = ggml_nelements(src1);
+            const int64_t ne10 = src1->ne[0] ? src1->ne[0] : 1;
+            const int64_t ne11 = src1->ne[1];
+            const int64_t ne12 = src1->ne[2];
+            const struct ggml_type_traits * tr = ggml_get_type_traits(src0->type);
+            std::vector<float> rowbuf(nc > 0 ? nc : 1);
+            for (int64_t i = 0; i < nrid; i++) {
+                const int64_t i12 = i / (ne11 * ne10);
+                const int64_t i11 = (i - i12 * ne11 * ne10) / ne10;
+                const int64_t i10 = i - i12 * ne11 * ne10 - i11 * ne10;
+                const char * idp = (const char *) src1->data +
+                    (size_t)i10 * src1->nb[0] + (size_t)i11 * src1->nb[1] + (size_t)i12 * src1->nb[2];
+                int64_t id = (src1->type == GGML_TYPE_I64)
+                    ? *(const int64_t *) idp : (int64_t) *(const int32_t *) idp;
+                if (id < 0) id = 0;
+                if (id >= src0->ne[1]) id = src0->ne[1] - 1; // stay alive; CPU asserts
+                const char * srow = (const char *) src0->data +
+                    (size_t)id * src0->nb[1] + (size_t)i11 * src0->nb[2] + (size_t)i12 * src0->nb[3];
+                char * drow = (char *) node->data +
+                    (size_t)i10 * node->nb[1] + (size_t)i11 * node->nb[2] + (size_t)i12 * node->nb[3];
+                if (src0->type == GGML_TYPE_F32) {
+                    memcpy(drow, srow, (size_t)nc * 4);
+                } else if (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) {
+                    axcl_kv_fetch(srow, src0->type, rowbuf.data(), (int)nc);
+                    memcpy(drow, rowbuf.data(), (size_t)nc * 4);
+                } else {
+                    GGML_ASSERT(tr && tr->to_float);
+                    tr->to_float(srow, rowbuf.data(), nc);
+                    memcpy(drow, rowbuf.data(), (size_t)nc * 4);
+                }
+            }
+            break;
+        }
+        case GGML_OP_ROPE: {
+            // op_params: [0]=n_past, [1]=n_dims, [2]=mode, [3]=n_ctx,
+            // [4]=n_ctx_orig, floats from byte 20: freq_base, freq_scale...
+            // Layout follows the CPU kernel: ne[1]=heads, ne[2]=tokens, and
+            // positions are indexed by the TOKEN dim (pos[i2]), not the flat
+            // row. MROPE (mode 8/40) is not supported.
+            const int32_t * ip = (const int32_t *) node->op_params;
+            const int n_dims = ip[1] >= 2 ? ip[1] : (int) src0->ne[0];
+            const int mode   = ip[2];
+            float freq_base = 10000.0f, freq_scale = 1.0f;
+            memcpy(&freq_base,  (char *) node->op_params + 20, sizeof(float));
+            memcpy(&freq_scale, (char *) node->op_params + 24, sizeof(float));
+            const bool neo = (mode & 2) != 0; // GGML_ROPE_TYPE_NEOX pairing
+            const int64_t hd = src0->ne[0];
+            const int64_t n1 = src0->ne[1];
+            const int64_t half = n_dims / 2;
+            const int64_t nrows = ggml_nrows(node);
+            const int32_t * pos = (src1 != nullptr && src1->type == GGML_TYPE_I32)
+                                ? (const int32_t *) src1->data : nullptr;
+            const float * ffac = (node->src[2] != nullptr && node->src[2]->type == GGML_TYPE_F32)
+                                ? (const float *) node->src[2]->data : nullptr;
+            for (int64_t r = 0; r < nrows; r++) {
+                const float * x = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
+                float * dr = (float *) ((char *) node->data + axcl_row_off(node, r));
+                const int64_t i2 = (r / n1) % (src0->ne[2] ? src0->ne[2] : 1); // token index
+                const float p = pos ? (float) pos[i2] : 0.0f;
+                if (neo) {
+                    for (int64_t i = 0; i < half; i++) {
+                        const float ffs = ffac ? ffac[i] : 1.0f;
+                        const float theta = p * freq_scale / ffs * powf(freq_base, (float)(-2.0 * i) / n_dims);
+                        const float cv = cosf(theta), sv = sinf(theta);
+                        const float x0 = x[i], x1 = x[i + half];
+                        dr[i] = x0 * cv - x1 * sv;
+                        dr[i + half] = x0 * sv + x1 * cv;
+                    }
+                } else {
+                    for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
+                        const float ffs = ffac ? ffac[i0 / 2] : 1.0f;
+                        const float theta = p * freq_scale / ffs * powf(freq_base, (float)(-1.0 * i0) / n_dims);
+                        const float cv = cosf(theta), sv = sinf(theta);
+                        const float x0 = x[i0], x1 = x[i0 + 1];
+                        dr[i0] = x0 * cv - x1 * sv;
+                        dr[i0 + 1] = x0 * sv + x1 * cv;
+                    }
+                }
+                for (int64_t i = n_dims; i < hd; i++) dr[i] = x[i]; // partial-dim tail
+            }
+            break;
+        }
+        case GGML_OP_SET_ROWS: {
+            // CPU semantics: loops (i03, i02, i); ids broadcast with modulo on
+            // their outer dims; both source and destination offset by i02/i03
+            if (!src0 || !src0->data || !node || !node->data || !src1 || !src1->data) break;
+            const int64_t nc = src0->ne[0];
+            const ggml_type dt = node->type;
+            const size_t des = ggml_type_size(dt);
+            const int64_t ne02 = src0->ne[2], ne03 = src0->ne[3];
+            const int64_t ne11 = src1->ne[1] ? src1->ne[1] : 1, ne12 = src1->ne[2] ? src1->ne[2] : 1;
+            for (int64_t i03 = 0; i03 < ne03; i03++) {
+                for (int64_t i02 = 0; i02 < ne02; i02++) {
+                    for (int64_t i = 0; i < src0->ne[1]; i++) {
+                        const int64_t i12 = i03 % ne12;
+                        const int64_t i11 = i02 % ne11;
+                        const char * idp = (const char *) src1->data +
+                            (size_t)i * src1->nb[0] + (size_t)i11 * src1->nb[1] + (size_t)i12 * src1->nb[2];
+                        int64_t id = (src1->type == GGML_TYPE_I64)
+                            ? *(const int64_t *) idp : (int64_t) *(const int32_t *) idp;
+                        if (id < 0 || (size_t)((size_t)id * node->nb[1] + (size_t)nc * des) > ggml_nbytes(node)) continue;
+                        const char * srow = (const char *) src0->data +
+                            (size_t)i * src0->nb[1] + (size_t)i02 * src0->nb[2] + (size_t)i03 * src0->nb[3];
+                        char * drow = (char *) node->data +
+                            (size_t)id * node->nb[1] + (size_t)i02 * node->nb[2] + (size_t)i03 * node->nb[3];
+                        float buf[4096];
+                        const float * sr;
+                        if (src0->type == GGML_TYPE_F32) {
+                            sr = (const float *) srow;
+                        } else if (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) {
+                            axcl_kv_fetch(srow, src0->type, buf, (int)nc);
+                            sr = buf;
+                        } else {
+                            const auto * trq = ggml_get_type_traits(src0->type);
+                            if (!trq || !trq->to_float) continue;
+                            trq->to_float(srow, buf, nc);
+                            sr = buf;
+                        }
+                        if (dt == GGML_TYPE_F32) {
+                            memcpy(drow, sr, (size_t)nc * 4);
+                        } else if (dt == GGML_TYPE_F16) {
+                            ggml_fp16_t * h = (ggml_fp16_t *) drow;
+                            for (int64_t q = 0; q < nc; q++) h[q] = GGML_COMPUTE_FP32_TO_FP16(sr[q]);
+                        } else if (dt == GGML_TYPE_BF16) {
+                            uint16_t * h = (uint16_t *) drow;
+                            for (int64_t q = 0; q < nc; q++) {
+                                uint32_t u; memcpy(&u, &sr[q], 4);
+                                h[q] = (uint16_t)(u >> 16);
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // flash attention: src0=Q [D,nq,HQ,1], src1=K [D,seq,HKV,1], src2=V [seq,D,HKV,1]
+            // route to our fused attention engine; K/V stay device-resident.
+            // Batched prefill runs one engine call per token with a causal mask
+            // (the engine computes single-query attention).
+            if (g_attn.model == 0 || !src0 || !src1 || !node->src[2]) return false;
+            const struct ggml_tensor * qt = src0;
+            const struct ggml_tensor * kt = src1;
+            const struct ggml_tensor * vt = node->src[2];
+            const int HQ = 16, D = 128, HKV = 8;
+            if (qt->ne[0] != D || kt->ne[2] != HKV) return false; // wrong head config
+            {
+                static int dbg = getenv("GGML_AXCL_DEBUG_FA") ? 6 : 0;
+                if (dbg > 0) {
+                    dbg--;
+                    fprintf(stderr, "[fa-dbg] Q ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ty=%d | K ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ty=%d | V ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ty=%d | out ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+                        (long long)qt->ne[0],(long long)qt->ne[1],(long long)qt->ne[2],(long long)qt->ne[3], qt->nb[0],qt->nb[1],qt->nb[2],qt->nb[3], (int)qt->type,
+                        (long long)kt->ne[0],(long long)kt->ne[1],(long long)kt->ne[2],(long long)kt->ne[3], kt->nb[0],kt->nb[1],kt->nb[2],kt->nb[3], (int)kt->type,
+                        (long long)vt->ne[0],(long long)vt->ne[1],(long long)vt->ne[2],(long long)vt->ne[3], vt->nb[0],vt->nb[1],vt->nb[2],vt->nb[3], (int)vt->type,
+                        (long long)node->ne[0],(long long)node->ne[1],(long long)node->ne[2],(long long)node->ne[3], node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
+                }
+            }
+            const int nq = (int) qt->ne[1];
+            const int seq_total = (int) kt->ne[1];
+            if (seq_total > g_attn.t) return false; // context too long for engine
+
+            // K/V stay resident on the device: only tokens not yet uploaded are
+            // shipped (K view stride: token = nb[1]; V view is transposed so
+            // token = nb[0])
+            void * dk = nullptr, * dv = nullptr;
+            if (!axcl_attn_sync_kv(kt->data, vt->data, kt->nb[1], vt->nb[0],
+                                   kt->type, vt->type, seq_total, HKV, &dk, &dv)) return false;
+
+            const int base = seq_total - nq; // first cache slot of this ubatch
+            static float eq[16 * 128];
+            const size_t kv_bytes = (size_t)HQ * g_attn.t * D * 4;
+            for (int tq = 0; tq < nq; tq++) {
+                const int seq_t = base + tq + 1; // causal: token sees [0, base+tq]
+                // repack Q token tq: [D, nq, HQ] → engine [HQ, D]
+                for (int h = 0; h < HQ; h++)
+                    for (int d = 0; d < D; d++)
+                        eq[h * D + d] = *(const float *)((const char *)qt->data +
+                            (size_t)tq * qt->nb[1] + (size_t)d * qt->nb[0] + (size_t)h * qt->nb[2]);
+                // mask: 0 for valid, -1e9 beyond
+                for (int t = 0; t < g_attn.t; t++) g_attn.m_buf[t] = (t < seq_t) ? 0.0f : -1e9f;
+
+                axclrtMemcpy(g_attn.dq, eq, (size_t)HQ * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                axclrtMemcpy(g_attn.dm, g_attn.m_buf.data(), g_attn.t * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iq, g_attn.dq, (size_t)HQ * D * 4);
+                axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.ik, dk, kv_bytes);
+                axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iv, dv, kv_bytes);
+                axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.im, g_attn.dm, g_attn.t * 4);
+                axclrtEngineSetOutputBufferByIndex(g_attn.io, g_attn.iout, g_attn.dout, (size_t)HQ * D * 4);
+                if (axclrtEngineExecute(g_attn.model, g_attn.ectx, 0, g_attn.io) != AXCL_SUCC) {
+                    GGML_LOG_ERROR("ggml-axcl: attention engine execute failed\n");
+                    return false;
+                }
+                axclrtMemcpy(g_attn.out_buf.data(), g_attn.dout, (size_t)HQ * D * 4, AXCL_MEMCPY_DEVICE_TO_HOST);
+
+                // unpack: engine [HQ, D] → node [D, nq, HQ]
+                for (int h = 0; h < HQ; h++)
+                    for (int d = 0; d < D; d++)
+                        *(float *)((char *)node->data + (size_t)tq * node->nb[1] +
+                            (size_t)d * node->nb[0] + (size_t)h * node->nb[2]) =
+                            g_attn.out_buf[h * D + d];
+            }
+            break;
+        }
         case GGML_OP_DIAG_MASK_INF: {
-            // in-place on attention scores: set positions >= n_past to -inf
-            // op_params layout varies by version; read first 4 bytes as int
+            // CPU semantics: causal DIAGONAL mask — row j masks positions
+            // i > n_past + j; copy src first when not in-place
             int32_t n_past = 0;
             if (node->op_params) memcpy(&n_past, node->op_params, sizeof(int32_t));
             if (n_past < 0) n_past = 0;
+            if (src0 && src0->data != node->data && src0->data && node->data) {
+                memcpy(node->data, src0->data, ggml_nbytes(node));
+            }
             const int64_t nc = node->ne[0];
-            const int64_t nr = ggml_nrows(node);
-            for (int64_t r = 0; r < nr; r++) {
-                float * dr = (float *)((char *)node->data + axcl_row_off(node, r));
-                for (int64_t i = n_past; i < nc && i < (int64_t)(ggml_nbytes(node)/4); i++) {
-                    dr[i] = -INFINITY;
+            const int64_t nrj = node->ne[1];
+            const int64_t nz = ggml_nrows(node) / (nrj ? nrj : 1);
+            for (int64_t k = 0; k < nz; k++) {
+                for (int64_t j = 0; j < nrj; j++) {
+                    float * dr = (float *)((char *)node->data + k * node->nb[2] + j * node->nb[1]);
+                    for (int64_t i = n_past; i < nc; i++) {
+                        if (i > n_past + j) dr[i] = -INFINITY;
+                    }
                 }
             }
             break;
@@ -1295,7 +1474,8 @@ static struct ggml_tensor * xqkv_q[3] = {nullptr, nullptr, nullptr};
 static const void * xqkv_src1 = nullptr; // shared src1 of the projections
 static int xqkv_count = 0;
 
-static void axcl_qkv_try_flush() {
+static bool axcl_qkv_try_flush() {
+    bool ok = false;
     if (xqkv_count == 3 && g_qkv.model != 0) {
         // h = the shared src1 (already normed by the host-side RMS_NORM)
         struct ggml_tensor * h = xqkv_q[0]->src[1];
@@ -1304,7 +1484,7 @@ static void axcl_qkv_try_flush() {
         else {
             const auto * tr = ggml_get_type_traits(h->type);
             if (tr && tr->to_float) tr->to_float(h->data, h_buf, 1024);
-            else { xqkv_count = 0; xqkv_src1 = nullptr; return; }
+            else { xqkv_count = 0; xqkv_src1 = nullptr; xqkv_q[0] = xqkv_q[1] = xqkv_q[2] = nullptr; return false; }
         }
         axclrtMemcpy(g_qkv.dev_in[0], h_buf, 1024*4, AXCL_MEMCPY_HOST_TO_DEVICE);
         void * dqw = axcl_fused_stage_w(&g_qkv, xqkv_q[0]->src[0], (size_t)1024*2048*4);
@@ -1322,11 +1502,13 @@ static void axcl_qkv_try_flush() {
                 axclrtMemcpy(xqkv_q[0]->data, g_qkv.dev_out[0], 2048*4, AXCL_MEMCPY_DEVICE_TO_HOST);
                 axclrtMemcpy(xqkv_q[1]->data, g_qkv.dev_out[1], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
                 axclrtMemcpy(xqkv_q[2]->data, g_qkv.dev_out[2], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
-                            }
+                ok = true;
+            }
         }
     }
     xqkv_count = 0; xqkv_src1 = nullptr;
     xqkv_q[0] = xqkv_q[1] = xqkv_q[2] = nullptr;
+    return ok;
 }
 
 static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -1336,48 +1518,11 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         axclrtSetCurrentContext(g_axcl_ctx); // contexts are thread-local: bind worker threads
     }
 
-    // PRE-PASS: detect and execute fused engine patterns (QKV, gate+up).
-    // Nodes consumed by fused engines are added to `done` and skipped below.
+    // PRE-PASS: none. The gate+up fusion USED to execute here, but the
+    // pre-pass runs before any node is computed — it read the un-normalized
+    // hidden from an uninitialized buffer. Both fusions now run inside the
+    // main loop where their inputs are already computed.
     std::unordered_set<int> done;
-    {
-        for (int i = 0; i + 3 < cgraph->n_nodes; i++) {
-            struct ggml_tensor * n0 = cgraph->nodes[i];
-
-            if (n0->op == GGML_OP_RMS_NORM && g_qkv.model != 0 && false) { // handled by cross-split state
-                struct ggml_tensor * n1 = cgraph->nodes[i+1];
-                struct ggml_tensor * n2 = cgraph->nodes[i+2];
-                struct ggml_tensor * n3 = cgraph->nodes[i+3];
-                if (n1->op == GGML_OP_MUL_MAT && n2->op == GGML_OP_MUL_MAT && n3->op == GGML_OP_MUL_MAT &&
-                    n1->src[1] == n0 && n2->src[1] == n0 && n3->src[1] == n0 &&
-                    n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 2048 &&
-                    n2->src[0]->ne[0] == 1024 && n2->src[0]->ne[1] == 1024 &&
-                    n3->src[0]->ne[0] == 1024 && n3->src[0]->ne[1] == 1024) {
-                    // found QKV pattern: execute fused engine
-                    if (axcl_qkv_run(n0->src[0], n0->src[1],
-                                     n1->src[0], n2->src[0], n3->src[0],
-                                     (float *) n1->data, (float *) n2->data, (float *) n3->data)) {
-                        done.insert(i); done.insert(i+1); done.insert(i+2); done.insert(i+3);
-                        i += 3; // skip past
-                    }
-                }
-            }
-
-            // Pattern 2: gate_proj + up_proj (2 consecutive MUL_MATs sharing src1)
-            if (n0->op == GGML_OP_MUL_MAT && g_gate_up.model != 0 && i + 1 < cgraph->n_nodes) {
-                struct ggml_tensor * n1 = cgraph->nodes[i+1];
-                if (n1->op == GGML_OP_MUL_MAT && n1->src[1] == n0->src[1] &&
-                    n0->src[0]->ne[0] == 1024 && n0->src[0]->ne[1] == 3072 &&
-                    n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 3072 &&
-                    !done.count(i) && !done.count(i+1)) {
-                    if (axcl_gate_up_run(n0->src[1], n0->src[0], n1->src[0],
-                                          (float *) n0->data, (float *) n1->data)) {
-                        done.insert(i); done.insert(i+1);
-                                i += 1;
-                    }
-                }
-            }
-        }
-    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (done.count(i)) continue;
@@ -1387,24 +1532,44 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
             continue; // metadata-only: data pointer already correct
         }
-        // cross-split QKV: shape-based detection of q/k/v projections
-        if (node->op == GGML_OP_MUL_MAT && g_qkv.model != 0 && xqkv_count < 3) {
-            const int64_t k0 = node->src[0]->ne[0];
-            const int64_t n0 = node->src[0]->ne[1];
-            if (xqkv_count == 0 && k0 == 1024 && n0 == 2048) {
-                // q_proj: start pattern
-                xqkv_src1 = node->src[1];
-                xqkv_q[0] = node;
-                xqkv_count = 1;
-                continue; // skip individual compute
-            } else if (xqkv_count >= 1 && xqkv_count < 3 &&
-                       node->src[1] == xqkv_src1 && k0 == 1024 && n0 == 1024) {
-                // k_proj or v_proj (same src1 as q_proj)
-                xqkv_q[xqkv_count++] = node;
-                if (xqkv_count == 3) {
-                    axcl_qkv_try_flush();
+        // cross-split QKV fusion: q/k/v are three consecutive MUL_MATs
+        // sharing src1. Executed at the FIRST node — computing late (at the
+        // v node) violates the allocator's lifetime assumptions and corrupts
+        // downstream reads via reused chunks.
+        if (node->op == GGML_OP_MUL_MAT && g_qkv.model != 0 && i + 2 < cgraph->n_nodes &&
+            node->src[1]->ne[1] == 1 && getenv("GGML_AXCL_NO_FUSION") == nullptr) {
+            struct ggml_tensor * n1 = cgraph->nodes[i+1];
+            struct ggml_tensor * n2 = cgraph->nodes[i+2];
+            if (n1->op == GGML_OP_MUL_MAT && n2->op == GGML_OP_MUL_MAT &&
+                n1->src[1] == node->src[1] && n2->src[1] == node->src[1] &&
+                node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 2048 &&
+                n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 1024 &&
+                n2->src[0]->ne[0] == 1024 && n2->src[0]->ne[1] == 1024 &&
+                !done.count(i+1) && !done.count(i+2)) {
+                xqkv_q[0] = node; xqkv_q[1] = n1; xqkv_q[2] = n2; xqkv_count = 3;
+                const bool ok = axcl_qkv_try_flush();
+                if (ok) {
+                    done.insert(i+1); done.insert(i+2);
+                    continue;
                 }
-                continue; // skip individual compute
+                // engine unavailable: fall through, compute nodes individually
+            }
+        }
+        // gate+up fusion: two consecutive MUL_MATs sharing src1 — executed
+        // here in the main loop so the normed hidden is already computed
+        if (node->op == GGML_OP_MUL_MAT && g_gate_up.model != 0 && i + 1 < cgraph->n_nodes &&
+            getenv("GGML_AXCL_NO_FUSION") == nullptr) {
+            struct ggml_tensor * n1 = cgraph->nodes[i+1];
+            if (n1->op == GGML_OP_MUL_MAT && n1->src[1] == node->src[1] &&
+                node->src[1]->ne[1] == 1 &&
+                node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 3072 &&
+                n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 3072 &&
+                !done.count(i) && !done.count(i+1)) {
+                if (axcl_gate_up_run(node->src[1], node->src[0], n1->src[0],
+                                      (float *) node->data, (float *) n1->data)) {
+                    done.insert(i+1); // skip the up node below
+                    continue;         // gate node's output written by the engine
+                }
             }
         }
         if (ggml_axcl_host_op(node)) {
@@ -1413,7 +1578,19 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         if (node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor * src0 = node->src[0];
             struct ggml_tensor * src1 = node->src[1];
-            axcl_matmul *        mm   = axcl_matmul_get(src0->ne[0], src0->ne[1]);
+            // checksum trace: GGML_AXCL_TRACEMM=1 prints src1/dst sums per node
+            static int tracemm = getenv("GGML_AXCL_TRACEMM") ? 400 : 0;
+            double xin = 0.0;
+            if (tracemm > 0) {
+                const int64_t nel = src1->ne[0] * src1->ne[1] * src1->ne[2] * src1->ne[3];
+                for (int64_t e = 0; e < nel; e++)
+                    xin += *(const float *) ((const char *) src1->data +
+                        (e % (src1->ne[0]*src1->ne[1])) * src1->nb[0] + 0*src1->nb[1] +
+                        ((e / (src1->ne[0]*src1->ne[1])) % src1->ne[2]) * src1->nb[2] +
+                        (e / (src1->ne[0]*src1->ne[1]*src1->ne[2])) * src1->nb[3]);
+                // (approximate: assumes dim0/1 contiguous pairing good enough for a fingerprint)
+            }
+            axcl_matmul *        mm   = src1->ne[1] == 1 ? axcl_matmul_get(src0->ne[0], src0->ne[1]) : nullptr;
             if (mm != nullptr) {
                 if (!ggml_axcl_compute_mul_mat(mm, src0, src1, node)) {
                     GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT failed\n", i);
@@ -1423,7 +1600,8 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 // per-head attention matmuls (3D with ne[2]>1 for heads):
                 // q@k: ne[0]=seq(growing), ne[1]=128(head_dim), ne[2]=8(kv_heads)
                 // @v:  ne[0]=128(head_dim), ne[1]=seq(growing), ne[2]=8(kv_heads)
-                if (g_attn.model != 0 && src0->ne[2] > 1 &&
+                if (g_attn.model != 0 && src0->ne[2] > 1 && src1->ne[1] == 1 &&
+                    getenv("GGML_AXCL_NO_FUSION") == nullptr &&
                     (src0->ne[1] == 128 || src0->ne[0] == 128)) {
                     if (src0->ne[1] == 128 && src0->ne[0] > 128) {
                         // q@k: buffer Q (src1) and K cache (src0), skip computing
@@ -1433,73 +1611,47 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     }
                     if (src0->ne[0] == 128 && src0->ne[1] > 128 &&
                         attn_q_buf != nullptr && attn_k_buf != nullptr) {
-                        // @v: call attention engine with buffered Q, K + this V
-                        // repack from 3D per-head to flat [HQ, D] / [HQ, T, D]
+                        // @v: run the attention engine with buffered Q, K + this V.
+                        // K/V stay device-resident; only new tokens are uploaded.
                         const struct ggml_tensor * qt = attn_q_buf;
                         const struct ggml_tensor * kt = attn_k_buf;
                         const struct ggml_tensor * vt = src0;
-                        const int HQ = 16, D = 128, HKV = 8, G = HQ / HKV;
-                        const int seq = (int) kt->ne[0]; // seq from K cache
-                        if (seq <= g_attn.t) {
-                            static float eq[HQ * D];
-                            static std::vector<float> ek, ev;
-                            ek.resize((size_t) HQ * g_attn.t * D);
-                            ev.resize((size_t) HQ * g_attn.t * D);
-                            // Q: [D, 1, HQ] → [HQ, D]
+                        const int HQ = 16, D = 128, HKV = 8;
+                        const int seq = (int) kt->ne[0];
+                        // Q view is [D, 1, HQ] → flat [HQ, D]
+                        static float eq[HQ * D], out_flat[HQ * D];
+                        for (int h = 0; h < HQ; h++)
+                            for (int d = 0; d < D; d++)
+                                eq[h * D + d] = *(const float *)((const char *)qt->data +
+                                    (size_t)d * qt->nb[0] + (size_t)h * qt->nb[2]);
+                        // K view is [seq, D, HKV] (token stride nb[0]); V view is
+                        // [D, seq, HKV] (token stride nb[1])
+                        if (axcl_attn_run(eq, kt->data, vt->data, kt->nb[0], vt->nb[1],
+                                          kt->type, vt->type, seq, HKV, D, out_flat)) {
+                            // unpack: [HQ, D] → node [D, 1, HQ]
                             for (int h = 0; h < HQ; h++)
                                 for (int d = 0; d < D; d++)
-                                    eq[h * D + d] = *(const float *)((const char *)qt->data +
-                                        (size_t)d * qt->nb[0] + (size_t)h * qt->nb[2]);
-                            // K: [seq, D, HKV] → [HQ, T, D] with GQA repeat
-                            for (int h = 0; h < HQ; h++) {
-                                int hk = h / G;
-                                for (int t = 0; t < g_attn.t; t++) {
-                                    float * kd = &ek[((size_t)h * g_attn.t + t) * D];
-                                    float * vd = &ev[((size_t)h * g_attn.t + t) * D];
-                                    if (t < seq) {
-                                        for (int d = 0; d < D; d++) {
-                                            kd[d] = *(const float *)((const char *)kt->data +
-                                                (size_t)t * kt->nb[0] + (size_t)d * kt->nb[1] + (size_t)hk * kt->nb[2]);
-                                            vd[d] = *(const float *)((const char *)vt->data +
-                                                (size_t)d * vt->nb[0] + (size_t)t * vt->nb[1] + (size_t)hk * vt->nb[2]);
-                                        }
-                                    } else {
-                                        memset(kd, 0, D * 4);
-                                        memset(vd, 0, D * 4);
-                                    }
-                                }
-                            }
-                            for (int t = 0; t < g_attn.t; t++) g_attn.m_buf[t] = (t < seq) ? 0.0f : -1e9f;
-                            axclrtMemcpy(g_attn.dq, eq, (size_t)HQ * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-                            axclrtMemcpy(g_attn.dk, ek.data(), (size_t)HQ * g_attn.t * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-                            axclrtMemcpy(g_attn.dv, ev.data(), (size_t)HQ * g_attn.t * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-                            axclrtMemcpy(g_attn.dm, g_attn.m_buf.data(), g_attn.t * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-                            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iq, g_attn.dq, (size_t)HQ * D * 4);
-                            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.ik, g_attn.dk, (size_t)HQ * g_attn.t * D * 4);
-                            
-                            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iv, g_attn.dv, (size_t)HQ * g_attn.t * D * 4);
-                            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.im, g_attn.dm, g_attn.t * 4);
-                            axclrtEngineSetOutputBufferByIndex(g_attn.io, g_attn.iout, g_attn.dout, (size_t)HQ * D * 4);
-                            if (axclrtEngineExecute(g_attn.model, g_attn.ectx, 0, g_attn.io) == AXCL_SUCC) {
-                                axclrtMemcpy(g_attn.out_buf.data(), g_attn.dout, (size_t)HQ * D * 4, AXCL_MEMCPY_DEVICE_TO_HOST);
-                                // unpack: [HQ, D] → [D, 1, HQ]
-                                for (int h = 0; h < HQ; h++)
-                                    for (int d = 0; d < D; d++)
-                                        *(float *)((char *)node->data + (size_t)d * node->nb[0] + (size_t)h * node->nb[2]) =
-                                            g_attn.out_buf[h * D + d];
-                                attn_q_buf = attn_k_buf = nullptr;
-                                prof_hostops++;
-                                continue;
-                            }
+                                    *(float *)((char *)node->data + (size_t)d * node->nb[0] + (size_t)h * node->nb[2]) =
+                                        out_flat[h * D + d];
+                            attn_q_buf = attn_k_buf = nullptr;
+                            prof_hostops++;
+                            continue;
                         }
                         attn_q_buf = attn_k_buf = nullptr;
                         // engine failed: fall through to scalar
                     }
                 }
-                // scalar fallback: handles 2D and batched 3D/4D matmul
+                // scalar fallback: full matmul for any src0 type and batch M.
+                // This is the prefill path (M>1) — engines are single-token.
                 {
                     const int64_t k = src0->ne[0], n = src0->ne[1];
+                    const int64_t m = src1->ne[1];
                     const int64_t b2 = node->ne[2], b3 = node->ne[3];
+                    const struct ggml_type_traits * tr = ggml_get_type_traits(src0->type);
+                    std::vector<float> wrow(src0->type == GGML_TYPE_F32 ? (size_t) 1 : (size_t) k);
+                    // self-check: independent double-precision reference of the
+                    // first few rows (debug switch GGML_AXCL_SELFCHECK=1)
+                    static int selfchk = getenv("GGML_AXCL_SELFCHECK") ? 3 : 0;
                     for (int64_t j3 = 0; j3 < b3; j3++) {
                         for (int64_t j2 = 0; j2 < b2; j2++) {
                             const char * wb = (const char *) src0->data +
@@ -1508,15 +1660,104 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                                 (size_t)(j2 % src1->ne[2]) * src1->nb[2] + (size_t)(j3 % src1->ne[3]) * src1->nb[3];
                             char * db = (char *) node->data +
                                 (size_t)j2 * node->nb[2] + (size_t)j3 * node->nb[3];
-                            const float * x = (const float *) xb;
                             for (int64_t nn = 0; nn < n; nn++) {
-                                const float * w = (const float *) (wb + (size_t) nn * src0->nb[1]);
-                                float acc = 0.0f;
-                                for (int64_t kk = 0; kk < k; kk++) acc += w[kk] * x[kk];
-                                *(float *) (db + (size_t) nn * node->nb[1]) = acc;
+                                // weight row nn: dequant once, reuse for all m columns
+                                const float * w32;
+                                if (src0->type == GGML_TYPE_F32) {
+                                    w32 = (const float *) (wb + (size_t) nn * src0->nb[1]);
+                                } else {
+                                    if (!tr || !tr->to_float) break;
+                                    tr->to_float(wb + (size_t) nn * src0->nb[1], wrow.data(), k);
+                                    w32 = wrow.data();
+                                }
+                                for (int64_t mm = 0; mm < m; mm++) {
+                                    const char * xr = xb + (size_t) mm * src1->nb[1];
+                                    float acc = 0.0f;
+                                    for (int64_t kk = 0; kk < k; kk++)
+                                        acc += w32[kk] * *(const float *) (xr + (size_t) kk * src1->nb[0]);
+                                    *(float *) (db + (size_t) mm * node->nb[1] + (size_t) nn * node->nb[0]) = acc;
+                                }
+                                if (selfchk > 0 && nn < 4) {
+                                    // independent reference for row nn, column 0
+                                    double ref = 0.0;
+                                    for (int64_t kk = 0; kk < k; kk++) {
+                                        float wv;
+                                        if (src0->type == GGML_TYPE_F32) {
+                                            wv = *(const float *)(wb + (size_t)nn*src0->nb[1] + (size_t)kk*src0->nb[0]);
+                                        } else {
+                                            wv = wrow[kk];
+                                        }
+                                        ref += (double)wv * *(const float *)(xb + (size_t)kk * src1->nb[0]);
+                                    }
+                                    float got = *(const float *)(db + (size_t)nn * node->nb[0]);
+                                    if (fabs(got - (float)ref) > 1e-3 * (1.0 + fabs(ref))) {
+                                        fprintf(stderr, "[selfcheck] MUL_MAT mismatch nn=%lld got=%.6f ref=%.6f (k=%lld n=%lld m=%lld j2=%lld src0ty=%d)\n",
+                                                (long long)nn, got, (float)ref, (long long)k, (long long)n, (long long)m, (long long)j2, (int)src0->type);
+                                    }
+                                }
                             }
                         }
                     }
+                }
+                if (tracemm > 0) {
+                    tracemm--;
+                    double ysum = 0.0;
+                    const int64_t dnel = node->ne[0] * node->ne[1] * node->ne[2] * node->ne[3];
+                    for (int64_t e = 0; e < dnel; e++)
+                        ysum += *(const float *) ((const char *) node->data +
+                            (e % (node->ne[0]*node->ne[1])) * node->nb[0] +
+                            ((e / (node->ne[0]*node->ne[1])) % node->ne[2]) * node->nb[2] +
+                            (e / (node->ne[0]*node->ne[1]*node->ne[2])) * node->nb[3]);
+                    fprintf(stderr, "[trace-mm] k=%lld n=%lld m=%lld xin=%.4f ysum=%.4f\n",
+                            (long long) src0->ne[0], (long long) src0->ne[1], (long long) src1->ne[1], xin, ysum);
+                }
+                // dump 3D attention matmul tensors for offline verification
+                static const char * dumpdir = getenv("GGML_AXCL_DUMPDIR");
+                static int ndumps = getenv("GGML_AXCL_DUMPDIR") ? 4 : 0;
+                static int ndump2d = getenv("GGML_AXCL_DUMPDIR") ? 2 : 0;
+                if (dumpdir != nullptr && src0->ne[2] > 1 && ndumps > 0) {
+                    char p[512];
+                    snprintf(p, sizeof(p), "%s/n%d_k%lld_n%lld", dumpdir, ndumps,
+                             (long long) src0->ne[0], (long long) src0->ne[1]);
+                    ndumps--;
+                    mkdir(dumpdir, 0755);
+                    auto dump = [&](const char * tag, const ggml_tensor * t) {
+                        char q[1024];
+                        snprintf(q, sizeof(q), "%s_%s.bin", p, tag);
+                        FILE * f = fopen(q, "wb");
+                        if (f) { fwrite(t->data, 1, ggml_nbytes(t), f); fclose(f); }
+                        snprintf(q, sizeof(q), "%s_%s.meta", p, tag);
+                        f = fopen(q, "w");
+                        if (f) {
+                            fprintf(f, "type=%d ne=%lld,%lld,%lld,%lld nb=%zu,%zu,%zu,%zu\n", (int)t->type,
+                                (long long)t->ne[0],(long long)t->ne[1],(long long)t->ne[2],(long long)t->ne[3],
+                                t->nb[0],t->nb[1],t->nb[2],t->nb[3]);
+                            fclose(f);
+                        }
+                    };
+                    dump("src0", src0); dump("src1", src1); dump("dst", node);
+                    fprintf(stderr, "[dump] 3D matmul tensors written to %s\n", p);
+                }
+                if (dumpdir != nullptr && src0->ne[2] == 1 && (src0->ne[0] == 2048 || src0->ne[0] == 1024) && src0->ne[1] == 2048 && ndump2d > 0) {
+                    char p[512];
+                    snprintf(p, sizeof(p), "%s/q%d", dumpdir, ndump2d);
+                    ndump2d--;
+                    auto dump = [&](const char * tag, const ggml_tensor * t) {
+                        char q[1024];
+                        snprintf(q, sizeof(q), "%s_%s.bin", p, tag);
+                        FILE * f = fopen(q, "wb");
+                        if (f) { fwrite(t->data, 1, ggml_nbytes(t), f); fclose(f); }
+                        snprintf(q, sizeof(q), "%s_%s.meta", p, tag);
+                        f = fopen(q, "w");
+                        if (f) {
+                            fprintf(f, "type=%d ne=%lld,%lld,%lld,%lld nb=%zu,%zu,%zu,%zu\n", (int)t->type,
+                                (long long)t->ne[0],(long long)t->ne[1],(long long)t->ne[2],(long long)t->ne[3],
+                                t->nb[0],t->nb[1],t->nb[2],t->nb[3]);
+                            fclose(f);
+                        }
+                    };
+                    dump("src0", src0); dump("src1", src1); dump("dst", node);
+                    fprintf(stderr, "[dump] o_proj tensors written to %s\n", p);
                 }
                 prof_hostops++;
             }
@@ -1528,6 +1769,59 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
     return GGML_STATUS_SUCCESS;
 }
 
+//
+// events / synchronization
+//
+// our compute is fully synchronous, but the scheduler pipelines split graphs
+// and relies on event_record/event_wait between backends — with NULL hooks it
+// raced split-input copies against our compute (stale reads). A trivial
+// atomic-flag event makes the ordering explicit.
+//
+struct axcl_event {
+    std::atomic<int> flag{0};
+};
+
+static void ggml_backend_axcl_synchronize(ggml_backend_t backend) {
+    GGML_UNUSED(backend);
+    // all axcl work is issued and completed synchronously
+}
+
+static void ggml_backend_axcl_event_record(ggml_backend_t backend, ggml_backend_event_t ev) {
+    GGML_UNUSED(backend);
+    auto * e = (axcl_event *) ev->context;
+    e->flag.store(1, std::memory_order_release);
+}
+
+static void ggml_backend_axcl_event_wait(ggml_backend_t backend, ggml_backend_event_t ev) {
+    GGML_UNUSED(backend);
+    auto * e = (axcl_event *) ev->context;
+    while (e->flag.load(std::memory_order_acquire) == 0) {
+        // spin
+    }
+}
+
+static ggml_backend_event_t ggml_backend_axcl_device_event_new(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+    auto * ev = new ggml_backend_event();
+    ev->device = nullptr;
+    ev->context = new axcl_event();
+    return ev;
+}
+
+static void ggml_backend_axcl_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t ev) {
+    GGML_UNUSED(dev);
+    delete (axcl_event *) ev->context;
+    delete ev;
+}
+
+static void ggml_backend_axcl_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t ev) {
+    GGML_UNUSED(dev);
+    auto * e = (axcl_event *) ev->context;
+    while (e->flag.load(std::memory_order_acquire) == 0) {
+        // spin
+    }
+}
+
 static const struct ggml_backend_i ggml_backend_axcl_interface = {
     /* .get_name           = */ ggml_backend_axcl_name,
     /* .free               = */ ggml_backend_axcl_free,
@@ -1536,14 +1830,14 @@ static const struct ggml_backend_i ggml_backend_axcl_interface = {
     /* .set_tensor_2d_async= */ NULL,
     /* .get_tensor_2d_async= */ NULL,
     /* .cpy_tensor_async   = */ NULL,
-    /* .synchronize        = */ NULL,
+    /* .synchronize        = */ ggml_backend_axcl_synchronize,
     /* .graph_plan_create  = */ NULL,
     /* .graph_plan_free    = */ NULL,
     /* .graph_plan_update  = */ NULL,
     /* .graph_plan_compute = */ NULL,
     /* .graph_compute      = */ ggml_backend_axcl_graph_compute,
-    /* .event_record       = */ NULL,
-    /* .event_wait         = */ NULL,
+    /* .event_record       = */ ggml_backend_axcl_event_record,
+    /* .event_wait         = */ ggml_backend_axcl_event_wait,
     /* .graph_optimize     = */ NULL,
 };
 
@@ -1553,6 +1847,10 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
         return nullptr;
     }
     if (axcl_engine_global_init()) {
+        // GGML_AXCL_NO_ENGINES=1: activate the device but skip all engine
+        // loads — bisecting host-memory corruption during model load
+        const bool no_engines = getenv("GGML_AXCL_NO_ENGINES") != nullptr;
+        if (!no_engines) {
         axcl_preload_all_engines(); // outside the activation mutex
         axcl_weight_pool_init();
         axcl_attn_load();
@@ -1571,6 +1869,7 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
                 {1024*4, (size_t)1024*3072*4, (size_t)1024*3072*4},
                 {(size_t)3072*4, (size_t)3072*4});
             GGML_LOG_INFO("ggml-axcl: gate+up fused engine loaded\n");
+        }
         }
     }
     // translate ordinal to the real slot index via the activation probe
@@ -1660,8 +1959,14 @@ static ggml_backend_t ggml_backend_axcl_device_init_backend(ggml_backend_dev_t d
 }
 
 static ggml_backend_buffer_type_t ggml_backend_axcl_device_get_buffer_type(ggml_backend_dev_t dev) {
-    ggml_backend_axcl_device_context * ctx = (ggml_backend_axcl_device_context *) dev->context;
-    return ggml_backend_axcl_buffer_type(ctx->device);
+    GGML_UNUSED(dev);
+    // Host-memory backend (same contract as ggml-blas): compute reads and
+    // writes tensors directly in host RAM. Using the CPU buffer type is what
+    // BLAS does — a private buffer type that is not marked is_host makes the
+    // scheduler treat our host memory as opaque device memory and route
+    // cross-backend tensor access through its device-copy machinery, which
+    // produced corrupted (stale, aliased) tensor contents.
+    return ggml_backend_cpu_buffer_type();
 }
 
 static ggml_backend_buffer_t ggml_backend_axcl_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr,
@@ -1678,16 +1983,42 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
     // UNIVERSAL BACKEND: accept every op — matmuls go to NPU engines,
     // everything else runs host-side in our graph_compute. This eliminates
     // ALL scheduler splits during inference.
+    // Debug bisect: GGML_AXCL_SKIP_OPS="ROPE,SET_ROWS" pushes named ops to CPU.
+    static const char * skip_env = getenv("GGML_AXCL_SKIP_OPS");
+    if (skip_env != nullptr && skip_env[0] != '\0') {
+        char buf[256];
+        snprintf(buf, sizeof(buf), "%s,", skip_env);
+        char name[64];
+        snprintf(name, sizeof(name), "%s,", ggml_op_name(op->op));
+        if (strstr(buf, name) != nullptr) return false;
+    }
+    // Debug bisect: GGML_AXCL_MM_CPU="1024x2048,3072x1024" pushes MUL_MATs
+    // with those (K x N) weight shapes to the CPU backend
+    static const char * mm_env = getenv("GGML_AXCL_MM_CPU");
+    if (mm_env != nullptr && op->op == GGML_OP_MUL_MAT && op->src[0] != nullptr) {
+        char want[64];
+        snprintf(want, sizeof(want), "%lldx%lld,", (long long) op->src[0]->ne[0], (long long) op->src[0]->ne[1]);
+        char buf[512];
+        snprintf(buf, sizeof(buf), "%s,", mm_env);
+        if (strstr(buf, want) != nullptr) return false;
+    }
+    // Default: BLAS-style claim set — only MUL_MAT, verified correct
+    // end-to-end. Claiming metadata ops (VIEW/PERMUTE) makes the scheduler's
+    // split machinery create output copies we never write (metadata ops have
+    // no compute), so downstream splits read stale copy buffers — corrupted
+    // K/V views. GGML_AXCL_UNIVERSAL=1 claims everything; broken until the
+    // host-op path is reworked to avoid split hazards.
+    static const char * uni_env = getenv("GGML_AXCL_UNIVERSAL");
+    if (uni_env == nullptr) {
+        return op->op == GGML_OP_MUL_MAT;
+    }
     return true;
 }
 
 static bool ggml_backend_axcl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(buft);
-    // our compute path reads host memory directly (memcpy from t->data), so
-    // CPU-resident weights are fine - without this the scheduler never
-    // routes MUL_MAT to us when the model lives in host RAM
-    return true;
+    // host-memory backend: any buffer marked host works (same as ggml-blas)
+    return ggml_backend_buft_is_host(buft);
 }
 
 static bool ggml_backend_axcl_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
@@ -1709,9 +2040,9 @@ static const struct ggml_backend_device_i ggml_backend_axcl_device_interface = {
     /* .supports_op          = */ ggml_backend_axcl_device_supports_op,
     /* .supports_buft        = */ ggml_backend_axcl_device_supports_buft,
     /* .offload_op           = */ ggml_backend_axcl_device_offload_op,
-    /* .event_new            = */ NULL,
-    /* .event_free           = */ NULL,
-    /* .event_synchronize    = */ NULL,
+    /* .event_new            = */ ggml_backend_axcl_device_event_new,
+    /* .event_free           = */ ggml_backend_axcl_device_event_free,
+    /* .event_synchronize    = */ ggml_backend_axcl_device_event_synchronize,
 };
 
 //
