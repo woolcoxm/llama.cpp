@@ -287,6 +287,47 @@ static void axcl_preload_all_engines();
 
 static axclrtContext g_axcl_ctx = 0; // thread-local bind target for worker threads
 
+// card-resident weight pool: ONE CMM allocation carved bump-style so weights
+// upload exactly once (verified tolerable by test_pool: single malloc +
+// carved slots + interleaved executes). Falls back to per-call upload when
+// exhausted. Size via GGML_AXCL_WPOOL_MB (default 2560).
+struct axcl_weight_pool {
+    char *  base = nullptr;
+    char *  bump = nullptr;
+    size_t  remain = 0;
+    void * carve(size_t bytes) {
+        const size_t align = 4096;
+        size_t need = (bytes + align - 1) & ~(align - 1);
+        if (base == nullptr || need > remain) {
+            return nullptr;
+        }
+        void * p = bump;
+        bump += need;
+        remain -= need;
+        return p;
+    }
+};
+static axcl_weight_pool g_axcl_pool;
+
+static void axcl_weight_pool_init() {
+    if (g_axcl_pool.base != nullptr) {
+        return;
+    }
+    const char * env = getenv("GGML_AXCL_WPOOL_MB");
+    size_t mb = env ? strtoull(env, nullptr, 10) : 2560;
+    if (mb == 0) {
+        return; // pool disabled: always per-call upload
+    }
+    void * p = nullptr;
+    if (axclrtMalloc(&p, mb * 1024 * 1024, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC || !p) {
+        GGML_LOG_WARN("ggml-axcl: weight pool alloc (%zu MB) failed; using per-call uploads\n", mb);
+        return;
+    }
+    g_axcl_pool.base = g_axcl_pool.bump = (char *) p;
+    g_axcl_pool.remain = mb * 1024 * 1024;
+    GGML_LOG_INFO("ggml-axcl: weight pool ready (%zu MB)\n", mb);
+}
+
 static bool axcl_engine_global_init() {
     static bool initialized = false;
     static bool available   = false;
@@ -630,6 +671,7 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
     }
     if (axcl_engine_global_init()) {
         axcl_preload_all_engines(); // outside the activation mutex
+        axcl_weight_pool_init();
     }
     // translate ordinal to the real slot index via the activation probe
     int32_t slot = axcl_get_device_index(device);
