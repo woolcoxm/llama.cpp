@@ -1233,6 +1233,9 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 continue;
             }
         }
+        if (ggml_axcl_host_op(node)) {
+            continue; // fused host-side: no backend boundary
+        }
         if (node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor * src0 = node->src[0];
             struct ggml_tensor * src1 = node->src[1];
