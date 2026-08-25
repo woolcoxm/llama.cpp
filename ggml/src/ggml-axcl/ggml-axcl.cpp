@@ -701,21 +701,31 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
     const int64_t ne0  = node->ne[0];
     const int64_t nr   = ggml_nrows(node); // rows of ne0
 
+    fprintf(stderr, "[axcl-hop] %s ne=(%lld,%lld,%lld,%lld) src0=(%lld,%lld,%lld,%lld)\n",
+            ggml_op_name(node->op), (long long) node->ne[0], (long long) node->ne[1],
+            (long long) node->ne[2], (long long) node->ne[3],
+            (long long) src0->ne[0], (long long) src0->ne[1],
+            (long long) src0->ne[2], (long long) src0->ne[3]);
     switch (node->op) {
         case GGML_OP_RMS_NORM: {
             float eps;
             memcpy(&eps, node->op_params, sizeof(eps));
-            const float * x = (const float *) src0->data;
-            const float * w = (const float *) src1->data;
+            // src1 (weight) is optional in this ggml version: the weight
+            // multiply may arrive as a separate MUL op
             for (int64_t r = 0; r < nr; r++) {
                 const float * xr = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
                 float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
                 double ss = 0.0;
                 for (int64_t i = 0; i < ne0; i++) ss += (double) xr[i] * xr[i];
                 float rms = (float) (1.0 / sqrt(ss / ne0 + eps));
-                for (int64_t i = 0; i < ne0; i++) dr[i] = xr[i] * rms * w[i];
+                if (src1 != nullptr) {
+                    const float * w = (const float *) ((const char *) src1->data + axcl_row_off(src1, r));
+                    for (int64_t i = 0; i < ne0; i++) dr[i] = xr[i] * rms * w[i];
+                } else {
+                    for (int64_t i = 0; i < ne0; i++) dr[i] = xr[i] * rms;
+                }
             }
-            (void) x; (void) dst;
+            (void) dst;
             break;
         }
         case GGML_OP_ADD:
