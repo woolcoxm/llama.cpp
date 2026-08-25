@@ -186,8 +186,10 @@ static ggml_backend_buffer_t ggml_backend_axcl_buffer_type_alloc_buffer(ggml_bac
                                                                         size_t size) {
     size = axcl_aligned_size(size, axcl_alloc_alignment());
 
+    fprintf(stderr, "[axcl-buf] alloc_buffer(%zu MB)\n", size / 1024 / 1024);
     void * ptr = malloc(size);
     if (ptr == nullptr) {
+        fprintf(stderr, "[axcl-buf] HOST ALLOC FAILED for %zu bytes\n", size);
         GGML_LOG_ERROR("ggml-axcl: host alloc failed for %zu bytes\n", size);
         return ggml_backend_buffer_init(buft, ggml_backend_axcl_buffer_interface, nullptr, 0);
     }
@@ -995,10 +997,13 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
     // view-class ops are metadata-only (no data movement): the scheduler
     // places them in our splits, so accept and skip them at compute time
     switch (op->op) {
-        case GGML_OP_NONE:
-            // weight leaves in our buffer are readable (we dequant them):
-            // the scheduler probes op=NONE on tensors during coloring
-            return true;
+        case GGML_OP_NONE: {
+            // accept weight leaves ONLY when they already live in our buffer
+            // (accepting globally re-routes model weight placement and
+            // blows up the ctx-tensor allocator)
+            return op->buffer != nullptr &&
+                   strcmp(ggml_backend_buffer_name(op->buffer), "AXCL") == 0;
+        }
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
