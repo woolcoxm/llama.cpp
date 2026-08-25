@@ -580,6 +580,14 @@ static bool axcl_attn_sync_kv(const void * k_base, const void * v_base,
     return true;
 }
 
+// valid token count for the layer owning this K cache view
+static int axcl_attn_kv_wm(const void * k_base) {
+    for (int i = 0; i < g_attn.kv_n; i++) {
+        if (g_attn.kv[i].kptr == k_base) return g_attn.kv[i].wm;
+    }
+    return -1;
+}
+
 // run one fused attention call: incremental KV upload + execute + download
 static bool axcl_attn_run(const float * q, const void * k_cache, const void * v_cache,
                           size_t k_nb1, size_t v_nb1, ggml_type k_ty, ggml_type v_ty,
@@ -1475,7 +1483,23 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             const int HQ = 16, D = 128, HKV = 8;
             if (qt->ne[0] != D || kt->ne[2] != HKV) return false; // wrong head config
             const int nq = (int) qt->ne[1];
-            const int seq_total = (int) kt->ne[1];
+            // K view ne[1] is the PADDED cache width, not the valid count.
+            // The FA tensor has no direct validity info — but llama.cpp
+            // passes the causal mask as src[3]; read its last valid slot.
+            // Fallback: sync first, then the watermark tells the live count.
+            int seq_total = -1;
+            if (node->src[3] != nullptr) {
+                const struct ggml_tensor * msk = node->src[3];
+                // mask [n_kv] f16: 0 = valid, -inf = masked
+                const int mlen = (int) (msk->ne[0] * msk->ne[1] * msk->ne[2] * msk->ne[3]);
+                for (int t = mlen - 1; t >= 0; t--) {
+                    float v = (msk->type == GGML_TYPE_F16)
+                        ? GGML_COMPUTE_FP16_TO_FP32(((const ggml_fp16_t *) msk->data)[t])
+                        : ((const float *) msk->data)[t];
+                    if (v > -1e8f) { seq_total = t + 1; break; }
+                }
+            }
+            if (seq_total < 0) return false; // no mask — cannot determine validity
             if (seq_total > g_attn.t) return false; // context too long for engine
 
             void * dk = nullptr, * dv = nullptr;
@@ -2456,8 +2480,8 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
             case GGML_OP_CONT:
                 return false;
             case GGML_OP_FLASH_ATTN_EXT:
-                return false; // CPU flash-attn: our engine's FA output is
-                              // wrong under investigation (strides TBD)
+                return false; // CPU flash-attn: engine output wrong on long
+                              // prompts; needs tensor-level diff debugging
             default:
                 return true;
         }
