@@ -29,11 +29,22 @@ else()
 endif()
 
 find_library(AXCL_RT_LIB axcl_rt HINTS ${AXCL_LIB_DIRS} REQUIRED)
+# libaxcl_npu registers the NPU device provider; without it the runtime
+# reports "device 0 is not connected" even with the driver loaded
+find_library(AXCL_NPU_LIB axcl_npu HINTS ${AXCL_LIB_DIRS} REQUIRED)
 
 file(GLOB GGML_SOURCES_AXCL "*.cpp")
 
 ggml_add_backend_library(ggml-axcl ${GGML_SOURCES_AXCL})
-target_link_libraries(ggml-axcl PRIVATE ${AXCL_RT_LIB})
+# keep libaxcl_npu in the link even though we reference no symbols from it:
+# its static initializers register the NPU device provider, and the linker's
+# --as-needed default silently drops it otherwise
+target_link_libraries(ggml-axcl PRIVATE
+    -Wl,--no-as-needed
+    ${AXCL_RT_LIB}
+    ${AXCL_NPU_LIB}
+    -Wl,--as-needed
+)
 target_include_directories(ggml-axcl PRIVATE ${AXCL_INCLUDE_DIRS})
 
 message(STATUS "ggml-axcl: AXCL_INCLUDE_DIRS = ${AXCL_INCLUDE_DIRS}")
