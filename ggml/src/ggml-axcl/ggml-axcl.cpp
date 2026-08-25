@@ -275,17 +275,18 @@ struct axcl_matmul {
     int64_t m = 0, k = 0, n = 0;
 
     std::string x_name, w_name, y_name;
+    int x_idx = -1, w_idx = -1, y_idx = -1;
     axclrtEngineDataType x_type = AXCL_DATA_TYPE_NONE;
     axclrtEngineDataType w_type = AXCL_DATA_TYPE_NONE;
     axclrtEngineDataType y_type = AXCL_DATA_TYPE_NONE;
 
-    // host staging buffers (runtime copies them to the card per execute)
-    std::vector<ggml_fp16_t> x_h; // [M, K]
-    std::vector<ggml_fp16_t> w_h; // [K, N]
-    std::vector<ggml_fp16_t> y_h; // [M, N]
-
-    void * y_out_ptr  = nullptr; // buffer returned by the runtime
-    uint64_t y_out_sz = 0;
+    // canonical axcl-samples pattern: DEVICE buffers bound to the engine IO
+    // (host pointers are rejected card-side at execute time), plus host
+    // staging used through axclrtMemcpy
+    void * dx = nullptr;                 // f32 [K]
+    void * dw = nullptr;                 // f32 [K, N] (transposed weights)
+    void * dy = nullptr;                 // f32 [N]
+    std::vector<float> x_h, w_h, y_h;    // host staging
 };
 
 static bool axcl_engine_global_init() {
@@ -350,7 +351,8 @@ static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
     uint32_t n_in = axclrtEngineGetNumInputs(mm->io_info);
     uint32_t n_out = axclrtEngineGetNumOutputs(mm->io_info);
 
-    // expected: 2 inputs (X, W) + 1 output (Y)
+    // expected: 2 inputs (X, W) + 1 output (Y); the compiled graph keeps
+    // f32 boundaries (quantization is internal)
     for (uint32_t i = 0; i < n_in && i < 2; i++) {
         const char * name = axclrtEngineGetInputNameByIndex(mm->io_info, i);
         if (name != nullptr) {
@@ -371,14 +373,24 @@ static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
             }
         }
     }
+    mm->x_idx = axclrtEngineGetInputIndexByName(mm->io_info, mm->x_name.c_str());
+    mm->w_idx = axclrtEngineGetInputIndexByName(mm->io_info, mm->w_name.c_str());
+    mm->y_idx = axclrtEngineGetOutputIndexByName(mm->io_info, mm->y_name.c_str());
 
     mm->x_h.resize(k);
     mm->w_h.resize(k * n);
     mm->y_h.resize(n);
+    if (axclrtMalloc(&mm->dx, (size_t) k * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+        axclrtMalloc(&mm->dw, (size_t) k * n * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+        axclrtMalloc(&mm->dy, (size_t) n * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: CMM alloc failed for %s\n", path.c_str());
+        delete mm;
+        return nullptr;
+    }
 
-    GGML_LOG_INFO("ggml-axcl: matmul engine loaded %s (inputs '%s','%s' types %d,%d -> '%s' type %d)\n",
-                  path.c_str(), mm->x_name.c_str(), mm->w_name.c_str(), (int) mm->x_type, (int) mm->w_type,
-                  mm->y_name.c_str(), (int) mm->y_type);
+    GGML_LOG_INFO("ggml-axcl: matmul engine loaded %s (inputs '%s','%s' -> '%s', idx %d,%d -> %d)\n",
+                  path.c_str(), mm->x_name.c_str(), mm->w_name.c_str(), mm->y_name.c_str(), mm->x_idx,
+                  mm->w_idx, mm->y_idx);
 
     return mm;
 }
@@ -412,22 +424,22 @@ static axcl_matmul * axcl_matmul_get(int64_t k, int64_t n) {
 }
 
 // dequantize src0 (ggml weight, [K x N] row-major, ne0 = K) into a
-// transposed f16 [K, N] row-major host buffer: w[k*N + n] = src0[n][k]
-static void axcl_dequant_any_to_f16_transposed(const struct ggml_tensor * t, ggml_fp16_t * w16) {
+// transposed f32 [K, N] row-major host buffer: w[k*N + n] = src0[n][k]
+static void axcl_dequant_any_to_f32_transposed(const struct ggml_tensor * t, float * w32) {
     const int64_t k = t->ne[0];
     const int64_t n = t->ne[1];
     if (t->type == GGML_TYPE_F32) {
         const float * w = (const float *) t->data;
         for (int64_t nn = 0; nn < n; nn++) {
             for (int64_t kk = 0; kk < k; kk++) {
-                w16[kk * n + nn] = GGML_COMPUTE_FP32_TO_FP16(w[nn * k + kk]);
+                w32[kk * n + nn] = w[nn * k + kk];
             }
         }
     } else if (t->type == GGML_TYPE_F16) {
         const ggml_fp16_t * w = (const ggml_fp16_t *) t->data;
         for (int64_t nn = 0; nn < n; nn++) {
             for (int64_t kk = 0; kk < k; kk++) {
-                w16[kk * n + nn] = w[nn * k + kk];
+                w32[kk * n + nn] = GGML_COMPUTE_FP16_TO_FP32(w[nn * k + kk]);
             }
         }
     } else {
@@ -439,22 +451,23 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
                                       const struct ggml_tensor * src1, struct ggml_tensor * dst) {
     const int64_t k = mm->k;
     const int64_t n = mm->n;
-    const int64_t m = mm->m; // 1
 
     // X: activation, src1 is [K, 1] f32 contiguous
-    const float * x32 = (const float *) src1->data;
-    for (int64_t i = 0; i < k; i++) {
-        mm->x_h[i] = GGML_COMPUTE_FP32_TO_FP16(x32[i]);
-    }
+    memcpy(mm->x_h.data(), src1->data, (size_t) k * 4);
 
     // W: dequant + transpose into [K, N]
-    axcl_dequant_any_to_f16_transposed(src0, mm->w_h.data());
+    axcl_dequant_any_to_f32_transposed(src0, mm->w_h.data());
 
-    if (axclrtEngineSetInputBufferByName(mm->io, mm->x_name.c_str(), mm->x_h.data(),
-                                         mm->x_h.size() * sizeof(ggml_fp16_t)) != AXCL_SUCC ||
-        axclrtEngineSetInputBufferByName(mm->io, mm->w_name.c_str(), mm->w_h.data(),
-                                         mm->w_h.size() * sizeof(ggml_fp16_t)) != AXCL_SUCC) {
-        GGML_LOG_ERROR("ggml-axcl: set input buffers failed\n");
+    if (axclrtMemcpy(mm->dx, mm->x_h.data(), (size_t) k * 4, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC ||
+        axclrtMemcpy(mm->dw, mm->w_h.data(), (size_t) k * n * 4, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: H2D copy failed\n");
+        return false;
+    }
+
+    if (axclrtEngineSetInputBufferByIndex(mm->io, mm->x_idx, mm->dx, (size_t) k * 4) != AXCL_SUCC ||
+        axclrtEngineSetInputBufferByIndex(mm->io, mm->w_idx, mm->dw, (size_t) k * n * 4) != AXCL_SUCC ||
+        axclrtEngineSetOutputBufferByIndex(mm->io, mm->y_idx, mm->dy, (size_t) n * 4) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: bind device buffers failed\n");
         return false;
     }
 
@@ -463,21 +476,12 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
         return false;
     }
 
-    void *   y_ptr = nullptr;
-    uint64_t y_sz  = 0;
-    if (axclrtEngineGetOutputBufferByName(mm->io, mm->y_name.c_str(), &y_ptr, &y_sz) != AXCL_SUCC ||
-        y_ptr == nullptr) {
-        GGML_LOG_ERROR("ggml-axcl: get output buffer failed\n");
+    // Y: f32 [N] device -> host -> dst
+    if (axclrtMemcpy(mm->y_h.data(), mm->dy, (size_t) n * 4, AXCL_MEMCPY_DEVICE_TO_HOST) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: D2H copy failed\n");
         return false;
     }
-
-    // Y: [1, N] f16 -> dst f32 [N, 1]
-    const ggml_fp16_t * y16 = (const ggml_fp16_t *) y_ptr;
-    float *             out = (float *) dst->data;
-    for (int64_t i = 0; i < n; i++) {
-        out[i] = GGML_COMPUTE_FP16_TO_FP32(y16[i]);
-    }
-    GGML_UNUSED(m);
+    memcpy(dst->data, mm->y_h.data(), (size_t) n * 4);
     return true;
 }
 
