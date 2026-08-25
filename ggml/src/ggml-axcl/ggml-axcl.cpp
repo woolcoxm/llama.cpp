@@ -410,7 +410,7 @@ struct axcl_attn_engine {
     axclrtEngineIO     io   = nullptr;
     void * dq = nullptr, * dk = nullptr, * dv = nullptr, * dm = nullptr, * dout = nullptr;
     int iq = -1, ik = -1, iv = -1, im = -1, iout = -1;
-    int h_q = 16, h_kv = 8, d = 64, t = 512;
+    int h_q = 16, h_kv = 8, d = 128, t = 512;
     std::vector<float> q_buf, k_buf, v_buf, m_buf, out_buf; // host staging
 };
 static axcl_attn_engine g_attn;
@@ -420,7 +420,7 @@ static axcl_fused_engine g_gate_up; // gate + up projections
 static void axcl_attn_load() {
     if (g_attn.model != 0) return;
     const char * env = getenv("AXCL_ATTN_MODEL");
-    const char * path = env ? env : "/usr/local/share/ggml-axcl/attn_h16_d64_t512.axmodel";
+    const char * path = env ? env : "/usr/local/share/ggml-axcl/attn_h16_d128_t512.axmodel";
     FILE * f = fopen(path, "r");
     if (!f) return;
     fclose(f);
@@ -1039,8 +1039,8 @@ static bool axcl_qkv_run(struct ggml_tensor * hidden, struct ggml_tensor * norm_
                          float * q_out, float * k_out, float * v_out) {
     if (g_qkv.model == 0) return false;
     const size_t h_sz = 1024 * 4, n_sz = 1024 * 4;
-    const size_t qw_sz = (size_t)1024 * 1024 * 4, kw_sz = (size_t)1024 * 512 * 4;
-    const size_t q_sz = 1024 * 4, k_sz = 512 * 4, v_sz = 512 * 4;
+    const size_t qw_sz = (size_t)1024 * 2048 * 4, kw_sz = (size_t)1024 * 1024 * 4;
+    const size_t q_sz = 2048 * 4, k_sz = 1024 * 4, v_sz = 1024 * 4;
 
     // upload activation (hidden); stage weights once
     float h_buf[1024];
@@ -1143,9 +1143,9 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 struct ggml_tensor * n3 = cgraph->nodes[i+3];
                 if (n1->op == GGML_OP_MUL_MAT && n2->op == GGML_OP_MUL_MAT && n3->op == GGML_OP_MUL_MAT &&
                     n1->src[1] == n0 && n2->src[1] == n0 && n3->src[1] == n0 &&
-                    n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 1024 &&
-                    n2->src[0]->ne[0] == 1024 && n2->src[0]->ne[1] == 512 &&
-                    n3->src[0]->ne[0] == 1024 && n3->src[0]->ne[1] == 512) {
+                    n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 2048 &&
+                    n2->src[0]->ne[0] == 1024 && n2->src[0]->ne[1] == 1024 &&
+                    n3->src[0]->ne[0] == 1024 && n3->src[0]->ne[1] == 1024) {
                     // found QKV pattern: execute fused engine
                     if (axcl_qkv_run(n0->src[0], n0->src[1],
                                      n1->src[0], n2->src[0], n3->src[0],
@@ -1290,13 +1290,13 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
         axcl_weight_pool_init();
         axcl_attn_load();
         // QKV fused engine: rms_norm(hidden) -> q, k, v in one call
-        if (axcl_fused_load(&g_qkv, "/usr/local/share/ggml-axcl/qkv_h1024_kv512.axmodel",
+        if (axcl_fused_load(&g_qkv, "/usr/local/share/ggml-axcl/qkv_h1024_kv1024.axmodel",
                             {"hidden", "norm_w", "q_w", "k_w", "v_w"}, {"q", "k", "v"})) {
-            // sizes: hidden 4KB, norm 4KB, q_w 4MB, k_w 2MB, v_w 2MB; q 4KB, k 2KB, v 2KB
+            // D=128: q_w [1024,2048]=8MB, k_w/v_w [1024,1024]=4MB; q 8KB, k/v 4KB
             axcl_fused_alloc(&g_qkv,
-                {1024*4, 1024*4, (size_t)1024*1024*4, (size_t)1024*512*4, (size_t)1024*512*4},
-                {1024*4, 512*4, 512*4});
-            GGML_LOG_INFO("ggml-axcl: QKV fused engine loaded\n");
+                {1024*4, 1024*4, (size_t)1024*2048*4, (size_t)1024*1024*4, (size_t)1024*1024*4},
+                {2048*4, 1024*4, 1024*4});
+            GGML_LOG_INFO("ggml-axcl: QKV fused engine loaded (D=128)\n");
         }
         // gate+up fused engine: h @ gate_w, h @ up_w in one call
         if (axcl_fused_load(&g_gate_up, "/usr/local/share/ggml-axcl/gate_up_h1024_i3072.axmodel",
