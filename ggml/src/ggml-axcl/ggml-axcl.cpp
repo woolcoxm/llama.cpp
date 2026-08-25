@@ -1118,6 +1118,12 @@ static bool axcl_gate_up_run(struct ggml_tensor * h, struct ggml_tensor * gate_w
     return true;
 }
 
+// attention engine state: q@k buffers Q and K; @v triggers the engine call.
+// Intermediates (scale/mask/softmax) compute on garbage from un-computed q@k
+// — harmless because the engine's @v output replaces everything downstream
+static struct ggml_tensor * attn_q_buf = nullptr;
+static struct ggml_tensor * attn_k_buf = nullptr;
+
 // cross-split QKV: detect 3 MUL_MATs sharing src1 (shape-based, no norm)
 static struct ggml_tensor * xqkv_q[3] = {nullptr, nullptr, nullptr};
 static const void * xqkv_src1 = nullptr; // shared src1 of the projections
@@ -1164,10 +1170,6 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
     if (g_axcl_ctx) {
         axclrtSetCurrentContext(g_axcl_ctx); // contexts are thread-local: bind worker threads
     }
-
-    // fused-attention buffer state
-    struct ggml_tensor * attn_k = nullptr, * attn_q = nullptr, * attn_dst = nullptr;
-    int attn_state = 0; // 0=idle, 1=buffered q@k waiting for @v
 
     // PRE-PASS: detect and execute fused engine patterns (QKV, gate+up).
     // Nodes consumed by fused engines are added to `done` and skipped below.
@@ -1254,38 +1256,35 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT failed\n", i);
                     return GGML_STATUS_ABORTED;
                 }
-            } else if (g_attn.model != 0 && src1->ne[1] == 1 &&
-                       src0->ne[0] <= 128 && src0->ne[2] == 1) {
-                // attention matmul: buffer for the fused engine call.
-                // q@k^T has k=head_dim, n=seq; @v has k=seq, n=head_dim.
-                // both are small with src1->ne[1]==1 (batch-1 generation)
-                if (attn_state == 0) {
-                    // q@k^T: src0=K_cache [head_dim, seq], src1=Q [embd, 1]
-                    attn_k = src0; attn_q = src1; attn_dst = node;
-                    attn_state = 1; // waiting for @v
-                    // NOTE: we skip computing this node - the engine will
-                    // produce the final output at the @v step
-                } else if (attn_state == 1) {
-                    // @v: src0=V_cache [seq, head_dim], src1=attention_weights
-                    // run the fused engine: Q,K,V -> out
-                    int n_kv = (int) attn_k->ne[1]; // seq length
-                    if (n_kv <= g_attn.t) {
-                        if (axcl_attn_run(
-                                (const float *) attn_q->data,
-                                (const float *) attn_k->data,
-                                (const float *) src0->data,
-                                attn_k->nb[1], src0->nb[1],
-                                n_kv, 8, 64, // n_kv_heads=8, head_dim=64 (Qwen3-0.6B GQA)
-                                (float *) node->data)) {
-                            prof_hostops++;
-                            attn_state = 0;
-                            continue; // done: skip the scalar loops
-                        }
-                    }
-                    // engine unavailable or failed: fall through to scalar
-                    attn_state = 0;
+            } else if (g_attn.model != 0 && src1->ne[1] == 1 && src0->ne[2] == 1) {
+                // attention matmuls have dynamic shapes (seq grows per token)
+                // q@k: ne[0]=1024(KV dim, fixed), ne[1]=seq(dynamic) — buffer and skip
+                // @v:   ne[0]=seq(dynamic), ne[1]=1024(fixed) — call engine
+                if (src0->ne[0] == 1024 && src0->ne[1] > 0 && src0->ne[1] <= (int64_t) g_attn.t) {
+                    // q@k: save Q and K cache, skip computing (engine handles it at @v)
+                    attn_q_buf = src1;
+                    attn_k_buf = src0;
+                    continue; // output stays uninitialized — intermediates run on garbage
                 }
-                // scalar fallback
+                if (src0->ne[1] == 1024 && src0->ne[0] > 0 && src0->ne[0] <= (int64_t) g_attn.t &&
+                    attn_q_buf != nullptr && attn_k_buf != nullptr) {
+                    // @v: call attention engine with buffered Q, K + this V
+                    int seq = (int) src0->ne[0];
+                    bool ok = axcl_attn_run(
+                        (const float *) attn_q_buf->data,
+                        (const float *) attn_k_buf->data,
+                        (const float *) src0->data,
+                        attn_k_buf->nb[1], src0->nb[1],
+                        seq, 8, 128, // n_kv_heads=8, head_dim=128 (Qwen3-0.6B)
+                        (float *) node->data);
+                    attn_q_buf = attn_k_buf = nullptr; // consumed
+                    if (ok) {
+                        prof_hostops++;
+                        continue; // engine wrote the correct output
+                    }
+                    // engine failed: fall through to scalar
+                }
+                // scalar attention fallback
                 const int64_t k = src0->ne[0], n = src0->ne[1];
                 const float * x = (const float *) src1->data;
                 float *       d = (float *) node->data;
