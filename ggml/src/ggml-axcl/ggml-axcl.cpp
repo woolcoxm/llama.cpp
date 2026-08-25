@@ -682,6 +682,16 @@ static size_t axcl_off(const struct ggml_tensor * t, int64_t i0, int64_t i1, int
 
 static uint64_t prof_hostops = 0;
 
+// total byte offset of outer row r (r enumerates ne1*ne2*ne3 combos) - the
+// naive r*nb[1] indexing is wrong for 3D/4D tensors
+static size_t axcl_row_off(const struct ggml_tensor * t, int64_t r) {
+    const int64_t n1 = t->ne[1], n2 = t->ne[2];
+    int64_t i1 = r % n1;
+    int64_t i2 = (r / n1) % n2;
+    int64_t i3 = r / (n1 * n2);
+    return (size_t) i1 * t->nb[1] + (size_t) i2 * t->nb[2] + (size_t) i3 * t->nb[3];
+}
+
 // host-side compute for the fusion ops; tensors live in our host buffers.
 // returns false when the op is not ours
 static bool ggml_axcl_host_op(struct ggml_tensor * node) {
@@ -698,8 +708,8 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             const float * x = (const float *) src0->data;
             const float * w = (const float *) src1->data;
             for (int64_t r = 0; r < nr; r++) {
-                const float * xr = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
-                float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                const float * xr = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
+                float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
                 double ss = 0.0;
                 for (int64_t i = 0; i < ne0; i++) ss += (double) xr[i] * xr[i];
                 float rms = (float) (1.0 / sqrt(ss / ne0 + eps));
@@ -725,9 +735,9 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
                 }
             } else {
                 for (int64_t r = 0; r < nr; r++) {
-                    const float * a = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
-                    const float * b = (const float *) ((char *) src1->data + (size_t) (r % src1->ne[1]) * src1->nb[1]);
-                    float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                    const float * a = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
+                    const float * b = (const float *) ((char *) src1->data + axcl_row_off(src1, r % (src1->ne[1] * src1->ne[2] * src1->ne[3])));
+                    float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
                     for (int64_t i = 0; i < ne0; i++) {
                         float bv = (src1->ne[0] == 1) ? b[0] : b[i];
                         dr[i] = mul ? a[i] * bv : a[i] + bv;
@@ -742,8 +752,8 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             memcpy(&glu, node->op_params, sizeof(glu));
             const int64_t h = ne0 / 2;
             for (int64_t r = 0; r < nr; r++) {
-                const float * x  = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
-                float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                const float * x  = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
+                float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
                 for (int64_t i = 0; i < h; i++) {
                     float a = x[i], b = x[h + i], act;
                     switch ((enum ggml_glu_op) glu) {
@@ -762,8 +772,8 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             memcpy(params, node->op_params, sizeof(params));
             const float scale = params[0];
             for (int64_t r = 0; r < nr; r++) {
-                const float * x = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
-                float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                const float * x = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
+                float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
                 float mx = -INFINITY;
                 for (int64_t i = 0; i < ne0; i++) mx = fmaxf(mx, x[i] * scale);
                 float sum = 0.0f;
@@ -777,8 +787,8 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             float v;
             memcpy(&v, node->op_params, sizeof(v));
             for (int64_t r = 0; r < nr; r++) {
-                const float * x = (const float *) ((char *) src0->data + (size_t) r * src0->nb[1]);
-                float *       dr = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                const float * x = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
+                float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
                 for (int64_t i = 0; i < ne0; i++) dr[i] = x[i] * v;
             }
             break;
