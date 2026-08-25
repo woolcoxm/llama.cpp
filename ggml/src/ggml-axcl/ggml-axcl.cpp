@@ -1072,6 +1072,75 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             }
             break;
         }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            // flash attention: src0=Q [hd,1,H,1], src1=K [hd,seq,HKV,1], src2=V [seq,hd,HKV,1]
+            // route to our fused attention engine with 3D→flat repacking
+            if (g_attn.model == 0 || !src0 || !src1 || !node->src[2]) return false;
+            const struct ggml_tensor * qt = src0;
+            const struct ggml_tensor * kt = src1;
+            const struct ggml_tensor * vt = node->src[2];
+            const int HQ = 16, D = 128, HKV = 8, G = HQ / HKV;
+            if (qt->ne[0] != D || kt->ne[2] != HKV) return false; // wrong head config
+            const int seq = (int) kt->ne[1];
+            if (seq > g_attn.t) return false; // context too long for engine
+
+            // repack Q: [D, 1, HQ, 1] → engine [HQ, D]
+            // head h at offset h*qt->nb[2], elem d at d*qt->nb[0] → engine_Q[h*D+d]
+            static float eq[HQ * D];
+            for (int h = 0; h < HQ; h++)
+                for (int d = 0; d < D; d++)
+                    eq[h * D + d] = *(const float *)((const char *)qt->data + (size_t)d * qt->nb[0] + (size_t)h * qt->nb[2]);
+
+            // repack K: [D, seq, HKV, 1] → engine [HQ, T, D] with GQA repeat
+            // cache[d, t, kv_h] → engine_K[h, t, d] where kv_h = h/G
+            static std::vector<float> ek, ev;
+            ek.resize((size_t) HQ * g_attn.t * D);
+            ev.resize((size_t) HQ * g_attn.t * D);
+            for (int h = 0; h < HQ; h++) {
+                int hk = h / G;
+                for (int t = 0; t < g_attn.t; t++) {
+                    float * kd = &ek[((size_t)h * g_attn.t + t) * D];
+                    float * vd = &ev[((size_t)h * g_attn.t + t) * D];
+                    if (t < seq) {
+                        for (int d = 0; d < D; d++) {
+                            kd[d] = *(const float *)((const char *)kt->data +
+                                (size_t)d * kt->nb[0] + (size_t)t * kt->nb[1] + (size_t)hk * kt->nb[2]);
+                            // V is [seq, hd, HKV, 1]: v[t, d, hk]
+                            vd[d] = *(const float *)((const char *)vt->data +
+                                (size_t)t * vt->nb[0] + (size_t)d * vt->nb[1] + (size_t)hk * vt->nb[2]);
+                        }
+                    } else {
+                        memset(kd, 0, D * 4);
+                        memset(vd, 0, D * 4);
+                    }
+                }
+            }
+
+            // upload + execute
+            axclrtMemcpy(g_attn.dq, eq, (size_t)HQ * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+            axclrtMemcpy(g_attn.dk, ek.data(), (size_t)HQ * g_attn.t * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+            axclrtMemcpy(g_attn.dv, ev.data(), (size_t)HQ * g_attn.t * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+            // mask: 0 for valid, -1e9 beyond
+            for (int t = 0; t < g_attn.t; t++) g_attn.m_buf[t] = (t < seq) ? 0.0f : -1e9f;
+            axclrtMemcpy(g_attn.dm, g_attn.m_buf.data(), g_attn.t * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iq, g_attn.dq, (size_t)HQ * D * 4);
+            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.ik, g_attn.dk, (size_t)HQ * g_attn.t * D * 4);
+            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iv, g_attn.dv, (size_t)HQ * g_attn.t * D * 4);
+            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.im, g_attn.dm, g_attn.t * 4);
+            axclrtEngineSetOutputBufferByIndex(g_attn.io, g_attn.iout, g_attn.dout, (size_t)HQ * D * 4);
+            if (axclrtEngineExecute(g_attn.model, g_attn.ectx, 0, g_attn.io) != AXCL_SUCC) {
+                GGML_LOG_ERROR("ggml-axcl: attention engine execute failed\\n");
+                return false;
+            }
+            axclrtMemcpy(g_attn.out_buf.data(), g_attn.dout, (size_t)HQ * D * 4, AXCL_MEMCPY_DEVICE_TO_HOST);
+
+            // unpack: engine [HQ, D] → node [D, 1, HQ, 1]
+            for (int h = 0; h < HQ; h++)
+                for (int d = 0; d < D; d++)
+                    *(float *)((char *)node->data + (size_t)d * node->nb[0] + (size_t)h * node->nb[2]) =
+                        g_attn.out_buf[h * D + d];
+            break;
+        }
         case GGML_OP_CONT: {
             // stride-aware contiguous copy: src0 may be a permuted/transposed view
             // (raw memcpy would read wrong data from non-contiguous layouts)
