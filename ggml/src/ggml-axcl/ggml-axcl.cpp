@@ -801,13 +801,18 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
         }
         case GGML_OP_GET_ROWS: {
             // out[r, :] = rows(src0)[ src1[r] ] (dequant if needed)
-            const int64_t * ids = (const int64_t *) src1->data;
-            const int64_t   nc  = src0->ne[0];
+            const int64_t nrq = node->ne[1];
+            const int64_t nc  = src0->ne[0];
             const struct ggml_type_traits * tr = ggml_get_type_traits(src0->type);
             GGML_ASSERT(tr && tr->to_float);
             std::vector<float> rowbuf(nc);
-            for (int64_t r = 0; r < node->ne[1]; r++) {
-                int64_t id = ids[r];
+            for (int64_t r = 0; r < nrq; r++) {
+                int64_t id;
+                if (src1->type == GGML_TYPE_I32) {
+                    id = (int64_t) ((const int32_t *) ((const char *) src1->data + (size_t) r * src1->nb[1]))[0];
+                } else {
+                    id = ((const int64_t *) ((const char *) src1->data + (size_t) r * src1->nb[1]))[0];
+                }
                 GGML_ASSERT(id >= 0 && id < src0->ne[1]);
                 const void * srcrow = (const char *) src0->data + (size_t) id * src0->nb[1];
                 float * drow = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
