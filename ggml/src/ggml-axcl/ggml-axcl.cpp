@@ -1029,6 +1029,62 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             }
             break;
         }
+        case GGML_OP_ROPE: {
+            float freq_base = 10000.0f;
+            memcpy(&freq_base, (char *) node->op_params + 8, sizeof(float));
+            const int64_t hd = src0->ne[0];
+            const int64_t half = hd / 2;
+            const int64_t nrows = ggml_nrows(node);
+            int32_t pos = 0;
+            if (src1 != nullptr && src1->type == GGML_TYPE_I32 && src1->ne[0] > 0) {
+                memcpy(&pos, src1->data, sizeof(int32_t));
+            }
+            for (int64_t r = 0; r < nrows; r++) {
+                const float * x = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
+                float * dr = (float *) ((char *) node->data + axcl_row_off(node, r));
+                for (int64_t i = 0; i < half; i++) {
+                    float theta = powf(freq_base, (float)(-2.0 * i / hd));
+                    float cv = cosf(pos * theta), sv = sinf(pos * theta);
+                    float x0 = x[i], x1 = x[i + half];
+                    dr[i] = x0 * cv - x1 * sv;
+                    dr[i + half] = x0 * sv + x1 * cv;
+                }
+            }
+            break;
+        }
+        case GGML_OP_SET_ROWS: {
+            const struct ggml_tensor * ids = src1;
+            const int64_t nc = src0->ne[0];
+            const int64_t nr = ggml_nrows(src0);
+            for (int64_t r = 0; r < nr; r++) {
+                int32_t id;
+                if (ids->type == GGML_TYPE_I32) {
+                    id = *(const int32_t *)((const char *)ids->data + (size_t)r * ids->nb[1]);
+                } else {
+                    id = (int32_t)(*(const int64_t *)((const char *)ids->data + (size_t)r * ids->nb[1]));
+                }
+                const float * sr = (const float *)((char *)src0->data + axcl_row_off(src0, r));
+                float * drow = (float *)((char *)node->data + (size_t)id * node->nb[1]);
+                memcpy(drow, sr, (size_t)nc * 4);
+            }
+            break;
+        }
+        case GGML_OP_DIAG_MASK_INF: {
+            float n_past_f;
+            memcpy(&n_past_f, node->op_params, sizeof(float));
+            const int64_t np = (int64_t)n_past_f;
+            const int64_t nc = node->ne[0];
+            const int64_t nr = ggml_nrows(node);
+            for (int64_t r = 0; r < nr; r++) {
+                float * dr = (float *)((char *)node->data + axcl_row_off(node, r));
+                if (src0 && src0->data != node->data) {
+                    const float * x = (const float *)((char *)src0->data + axcl_row_off(src0, r));
+                    memcpy(dr, x, (size_t)nc * 4);
+                }
+                for (int64_t i = np; i < nc; i++) dr[i] = -INFINITY;
+            }
+            break;
+        }
         default:
             return false;
     }
