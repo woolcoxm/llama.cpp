@@ -1365,15 +1365,27 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     }
                     // engine failed: fall through to scalar
                 }
-                // scalar attention fallback
-                const int64_t k = src0->ne[0], n = src0->ne[1];
-                const float * x = (const float *) src1->data;
-                float *       d = (float *) node->data;
-                for (int64_t nn = 0; nn < n; nn++) {
-                    const float * w = (const float *) ((const char *) src0->data + (size_t) nn * src0->nb[1]);
-                    float acc = 0.0f;
-                    for (int64_t kk = 0; kk < k; kk++) acc += w[kk] * x[kk];
-                    d[nn] = acc;
+                // scalar fallback: handles 2D and batched 3D/4D matmul
+                {
+                    const int64_t k = src0->ne[0], n = src0->ne[1];
+                    const int64_t b2 = node->ne[2], b3 = node->ne[3];
+                    for (int64_t j3 = 0; j3 < b3; j3++) {
+                        for (int64_t j2 = 0; j2 < b2; j2++) {
+                            const char * wb = (const char *) src0->data +
+                                (size_t)(j2 % src0->ne[2]) * src0->nb[2] + (size_t)(j3 % src0->ne[3]) * src0->nb[3];
+                            const char * xb = (const char *) src1->data +
+                                (size_t)(j2 % src1->ne[2]) * src1->nb[2] + (size_t)(j3 % src1->ne[3]) * src1->nb[3];
+                            char * db = (char *) node->data +
+                                (size_t)j2 * node->nb[2] + (size_t)j3 * node->nb[3];
+                            const float * x = (const float *) xb;
+                            for (int64_t nn = 0; nn < n; nn++) {
+                                const float * w = (const float *) (wb + (size_t) nn * src0->nb[1]);
+                                float acc = 0.0f;
+                                for (int64_t kk = 0; kk < k; kk++) acc += w[kk] * x[kk];
+                                *(float *) (db + (size_t) nn * node->nb[1]) = acc;
+                            }
+                        }
+                    }
                 }
                 prof_hostops++;
             }
@@ -1535,100 +1547,10 @@ static ggml_backend_buffer_t ggml_backend_axcl_device_buffer_from_host_ptr(ggml_
 
 static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    // view-class ops are metadata-only (no data movement): the scheduler
-    // places them in our splits, so accept and skip them at compute time
-    switch (op->op) {
-        case GGML_OP_NONE: {
-            // accept weight leaves ONLY when they already live in our buffer
-            // (accepting globally re-routes model weight placement and
-            // blows up the ctx-tensor allocator)
-            return op->buffer != nullptr &&
-                   strcmp(ggml_backend_buffer_name(op->buffer), "AXCL") == 0;
-        }
-        case GGML_OP_RESHAPE:
-        case GGML_OP_VIEW:
-        case GGML_OP_PERMUTE:
-        case GGML_OP_TRANSPOSE:
-            return true;
-        default:
-            break;
-    }
-    // cheap host-side ops we compute ourselves: fusing these into our
-    // splits collapses the per-layer CPU<->NPU boundary count
-    switch (op->op) {
-        case GGML_OP_RMS_NORM:
-        case GGML_OP_ADD:
-        case GGML_OP_MUL:
-        case GGML_OP_GLU: // silu expressed as GLU in this ggml
-        case GGML_OP_SOFT_MAX:
-        case GGML_OP_SCALE:
-        case GGML_OP_CPY:
-        case GGML_OP_DUP:
-            return op->type == GGML_TYPE_F32;
-        case GGML_OP_ROPE:
-        case GGML_OP_SET_ROWS:
-        case GGML_OP_DIAG_MASK_INF:
-        case GGML_OP_FLASH_ATTN_EXT:
-            // claim the full attention block: with the KV cache allocated
-            // in our buffer, the scheduler routes attention to us
-            return true;
-        case GGML_OP_GET_ROWS:
-            return true;
-        default:
-            break;
-    }
-    if (op->op != GGML_OP_MUL_MAT) {
-        return false;
-    }
-    const struct ggml_tensor * src0 = op->src[0];
-    const struct ggml_tensor * src1 = op->src[1];
-    // one-line rejection telemetry per unique (k,n,m) triple
-    {
-        static std::mutex m;
-        static std::unordered_map<uint64_t, bool> seen;
-        uint64_t key = ((uint64_t) src0->ne[0] << 44) ^ ((uint64_t) src0->ne[1] << 12) ^ src1->ne[1];
-        std::lock_guard<std::mutex> l(m);
-        if (!seen.count(key)) {
-            seen[key] = true;
-            bool engine = axcl_matmul_get(src0->ne[0], src0->ne[1]) != nullptr;
-            fprintf(stderr, "[axcl-sched] MUL_MAT k=%lld n=%lld m=%lld type=%s engine=%d -> %s\n",
-                    (long long) src0->ne[0], (long long) src0->ne[1], (long long) src1->ne[1],
-                    ggml_type_name(src0->type), (int) engine,
-                    (engine && src1->ne[1] == 1) ? "ACCEPT" : "REJECT");
-        }
-    }
-    if (src0 == nullptr || src1 == nullptr) {
-        return false;
-    }
-    // any weight type is fine - the dequant path uses ggml type traits
-    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 &&
-        (ggml_get_type_traits(src0->type) == nullptr || ggml_get_type_traits(src0->type)->to_float == nullptr)) {
-        return false;
-    }
-    if (src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
-        return false;
-    }
-    // src0 must be a true 2D weight; src1 [K,1] counts as 1-D to ggml_n_dims,
-    // so check the higher dims explicitly instead
-    if (ggml_n_dims(src0) != 2 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
-        src0->ne[2] != 1 || src0->ne[3] != 1) {
-        return false;
-    }
-    if (src1->ne[1] != 1) {
-        return false; // decode only (M == 1); prefill stays on CPU
-    }
-    // engine path
-    if (axcl_matmul_get(src0->ne[0], src0->ne[1]) != nullptr) {
-        return true;
-    }
-    // no engine: run attention-sized dynamic-shape matmuls host-side so the
-    // scheduler never splits the attention block to CPU (each split costs
-    // ~3ms dispatch; there are ~9 per layer at batch-1)
-    if (src1->ne[1] == 1 && src0->type == GGML_TYPE_F32) {
-        const int64_t k = src0->ne[0], n = src0->ne[1];
-        return k <= 4096 && n <= 8192; // q@k^T etc: n grows with context
-    }
-    return false;
+    // UNIVERSAL BACKEND: accept every op — matmuls go to NPU engines,
+    // everything else runs host-side in our graph_compute. This eliminates
+    // ALL scheduler splits during inference.
+    return true;
 }
 
 static bool ggml_backend_axcl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
