@@ -1412,34 +1412,83 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     return GGML_STATUS_ABORTED;
                 }
             } else {
-                fprintf(stderr, "[axcl-unmatched] k=%lld n=%lld\n",
-                        (long long) src0->ne[0], (long long) src0->ne[1]);
-                // attention matmuls have dynamic shapes (seq grows per token)
-                // q@k: ne[0]=1024(KV dim, fixed), ne[1]=seq(dynamic) — buffer and skip
-                // @v:   ne[0]=seq(dynamic), ne[1]=1024(fixed) — call engine
-                if (src0->ne[0] == 1024 && src0->ne[1] > 0 && src0->ne[1] <= (int64_t) g_attn.t) {
-                    // q@k: save Q and K cache, skip computing (engine handles it at @v)
-                    attn_q_buf = src1;
-                    attn_k_buf = src0;
-                    continue; // output stays uninitialized — intermediates run on garbage
-                }
-                if (src0->ne[1] == 1024 && src0->ne[0] > 0 && src0->ne[0] <= (int64_t) g_attn.t &&
-                    attn_q_buf != nullptr && attn_k_buf != nullptr) {
-                    // @v: call attention engine with buffered Q, K + this V
-                    int seq = (int) src0->ne[0];
-                    bool ok = axcl_attn_run(
-                        (const float *) attn_q_buf->data,
-                        (const float *) attn_k_buf->data,
-                        (const float *) src0->data,
-                        attn_k_buf->nb[1], src0->nb[1],
-                        seq, 8, 128, // n_kv_heads=8, head_dim=128 (Qwen3-0.6B)
-                        (float *) node->data);
-                    attn_q_buf = attn_k_buf = nullptr; // consumed
-                    if (ok) {
-                        prof_hostops++;
-                        continue; // engine wrote the correct output
+                fprintf(stderr, "[axcl-unmatched] k=%lld n=%lld ne2=%lld\n",
+                        (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2]);
+                // per-head attention matmuls (3D with ne[2]>1 for heads):
+                // q@k: ne[0]=seq(growing), ne[1]=128(head_dim), ne[2]=8(kv_heads)
+                // @v:  ne[0]=128(head_dim), ne[1]=seq(growing), ne[2]=8(kv_heads)
+                if (g_attn.model != 0 && src0->ne[2] > 1 &&
+                    (src0->ne[1] == 128 || src0->ne[0] == 128)) {
+                    if (src0->ne[1] == 128 && src0->ne[0] > 128) {
+                        // q@k: buffer Q (src1) and K cache (src0), skip computing
+                        attn_q_buf = src1;
+                        attn_k_buf = src0;
+                        continue; // intermediates (scale/mask/softmax) run on garbage — harmless
                     }
-                    // engine failed: fall through to scalar
+                    if (src0->ne[0] == 128 && src0->ne[1] > 128 &&
+                        attn_q_buf != nullptr && attn_k_buf != nullptr) {
+                        // @v: call attention engine with buffered Q, K + this V
+                        // repack from 3D per-head to flat [HQ, D] / [HQ, T, D]
+                        const struct ggml_tensor * qt = attn_q_buf;
+                        const struct ggml_tensor * kt = attn_k_buf;
+                        const struct ggml_tensor * vt = src0;
+                        const int HQ = 16, D = 128, HKV = 8, G = HQ / HKV;
+                        const int seq = (int) kt->ne[0]; // seq from K cache
+                        if (seq <= g_attn.t) {
+                            static float eq[HQ * D];
+                            static std::vector<float> ek, ev;
+                            ek.resize((size_t) HQ * g_attn.t * D);
+                            ev.resize((size_t) HQ * g_attn.t * D);
+                            // Q: [D, 1, HQ] → [HQ, D]
+                            for (int h = 0; h < HQ; h++)
+                                for (int d = 0; d < D; d++)
+                                    eq[h * D + d] = *(const float *)((const char *)qt->data +
+                                        (size_t)d * qt->nb[0] + (size_t)h * qt->nb[2]);
+                            // K: [seq, D, HKV] → [HQ, T, D] with GQA repeat
+                            for (int h = 0; h < HQ; h++) {
+                                int hk = h / G;
+                                for (int t = 0; t < g_attn.t; t++) {
+                                    float * kd = &ek[((size_t)h * g_attn.t + t) * D];
+                                    float * vd = &ev[((size_t)h * g_attn.t + t) * D];
+                                    if (t < seq) {
+                                        for (int d = 0; d < D; d++) {
+                                            kd[d] = *(const float *)((const char *)kt->data +
+                                                (size_t)t * kt->nb[0] + (size_t)d * kt->nb[1] + (size_t)hk * kt->nb[2]);
+                                            vd[d] = *(const float *)((const char *)vt->data +
+                                                (size_t)d * vt->nb[0] + (size_t)t * vt->nb[1] + (size_t)hk * vt->nb[2]);
+                                        }
+                                    } else {
+                                        memset(kd, 0, D * 4);
+                                        memset(vd, 0, D * 4);
+                                    }
+                                }
+                            }
+                            for (int t = 0; t < g_attn.t; t++) g_attn.m_buf[t] = (t < seq) ? 0.0f : -1e9f;
+                            axclrtMemcpy(g_attn.dq, eq, (size_t)HQ * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                            axclrtMemcpy(g_attn.dk, ek.data(), (size_t)HQ * g_attn.t * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                            axclrtMemcpy(g_attn.dv, ev.data(), (size_t)HQ * g_attn.t * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                            axclrtMemcpy(g_attn.dm, g_attn.m_buf.data(), g_attn.t * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iq, g_attn.dq, (size_t)HQ * D * 4);
+                            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.ik, g_attn.dk, (size_t)HQ * g_attn.t * D * 4);
+                            
+                            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iv, g_attn.dv, (size_t)HQ * g_attn.t * D * 4);
+                            axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.im, g_attn.dm, g_attn.t * 4);
+                            axclrtEngineSetOutputBufferByIndex(g_attn.io, g_attn.iout, g_attn.dout, (size_t)HQ * D * 4);
+                            if (axclrtEngineExecute(g_attn.model, g_attn.ectx, 0, g_attn.io) == AXCL_SUCC) {
+                                axclrtMemcpy(g_attn.out_buf.data(), g_attn.dout, (size_t)HQ * D * 4, AXCL_MEMCPY_DEVICE_TO_HOST);
+                                // unpack: [HQ, D] → [D, 1, HQ]
+                                for (int h = 0; h < HQ; h++)
+                                    for (int d = 0; d < D; d++)
+                                        *(float *)((char *)node->data + (size_t)d * node->nb[0] + (size_t)h * node->nb[2]) =
+                                            g_attn.out_buf[h * D + d];
+                                attn_q_buf = attn_k_buf = nullptr;
+                                prof_hostops++;
+                                continue;
+                            }
+                        }
+                        attn_q_buf = attn_k_buf = nullptr;
+                        // engine failed: fall through to scalar
+                    }
                 }
                 // scalar fallback: handles 2D and batched 3D/4D matmul
                 {
