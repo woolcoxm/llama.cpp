@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <unordered_set>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -337,6 +338,70 @@ struct axcl_weight_pool {
 };
 static axcl_weight_pool g_axcl_pool;
 
+// generic multi-input/multi-output fused engine with weight staging
+struct axcl_fused_engine {
+    uint64_t model = 0, ectx = 0;
+    axclrtEngineIOInfo info = nullptr;
+    axclrtEngineIO     io   = nullptr;
+    std::vector<void *> dev_in;    // device buffers for each input
+    std::vector<void *> dev_out;   // device buffers for each output
+    std::vector<int>    in_idx;    // input indices by name order
+    std::vector<int>    out_idx;
+    // weight staging: maps ggml weight tensor ptr -> device buffer
+    std::unordered_map<const void *, void *> staged_w;
+    std::vector<float> scratch;     // dequant scratch
+};
+
+static bool axcl_fused_load(axcl_fused_engine * fe, const char * path,
+                            const std::vector<const char *> & in_names,
+                            const std::vector<const char *> & out_names) {
+    FILE * f = fopen(path, "r");
+    if (!f) return false;
+    fclose(f);
+    if (axclrtEngineLoadFromFile(path, &fe->model) != AXCL_SUCC) return false;
+    axclrtEngineGetIOInfo(fe->model, &fe->info);
+    axclrtEngineCreateIO(fe->info, &fe->io);
+    axclrtEngineCreateContext(fe->model, &fe->ectx);
+    fe->in_idx.clear(); fe->out_idx.clear();
+    for (auto n : in_names)  fe->in_idx.push_back(axclrtEngineGetInputIndexByName(fe->info, n));
+    for (auto n : out_names) fe->out_idx.push_back(axclrtEngineGetOutputIndexByName(fe->info, n));
+    return true;
+}
+
+// allocate device buffers for all IO (sizes from tensor dims via a size query)
+static void axcl_fused_alloc(axcl_fused_engine * fe,
+                             const std::vector<size_t> & in_sizes,
+                             const std::vector<size_t> & out_sizes) {
+    fe->dev_in.resize(in_sizes.size());
+    fe->dev_out.resize(out_sizes.size());
+    for (size_t i = 0; i < in_sizes.size(); i++)
+        axclrtMalloc(&fe->dev_in[i], in_sizes[i], AXCL_MEM_MALLOC_HUGE_FIRST);
+    for (size_t i = 0; i < out_sizes.size(); i++)
+        axclrtMalloc(&fe->dev_out[i], out_sizes[i], AXCL_MEM_MALLOC_HUGE_FIRST);
+}
+
+// stage a weight tensor (dequant to f32 if needed, upload once)
+static void * axcl_fused_stage_w(axcl_fused_engine * fe, const struct ggml_tensor * w, size_t bytes) {
+    auto it = fe->staged_w.find(w->data);
+    if (it != fe->staged_w.end()) return it->second;
+    void * dev = nullptr;
+    axclrtMalloc(&dev, bytes, AXCL_MEM_MALLOC_HUGE_FIRST);
+    if (dev == nullptr) return nullptr;
+    if (w->type == GGML_TYPE_F32) {
+        axclrtMemcpy(dev, w->data, bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
+    } else {
+        fe->scratch.resize(bytes / 4);
+        const auto * tr = ggml_get_type_traits(w->type);
+        if (tr && tr->to_float) {
+            const int64_t total = w->ne[0] * w->ne[1];
+            tr->to_float(w->data, fe->scratch.data(), total);
+            axclrtMemcpy(dev, fe->scratch.data(), bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
+        }
+    }
+    fe->staged_w[w->data] = dev;
+    return dev;
+}
+
 // fused attention engine: softmax(q*K^T*scale + mask)*V for all heads
 // in one NPU execute (mixed precision, GQA via host-side head repeat)
 struct axcl_attn_engine {
@@ -349,6 +414,8 @@ struct axcl_attn_engine {
     std::vector<float> q_buf, k_buf, v_buf, m_buf, out_buf; // host staging
 };
 static axcl_attn_engine g_attn;
+static axcl_fused_engine g_qkv;   // rms_norm + q/k/v projections
+static axcl_fused_engine g_gate_up; // gate + up projections
 
 static void axcl_attn_load() {
     if (g_attn.model != 0) return;
@@ -966,6 +1033,91 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
     return true;
 }
 
+// execute the QKV fused engine: hidden + norm_w + weights -> q, k, v
+static bool axcl_qkv_run(struct ggml_tensor * hidden, struct ggml_tensor * norm_w,
+                         struct ggml_tensor * q_w, struct ggml_tensor * k_w, struct ggml_tensor * v_w,
+                         float * q_out, float * k_out, float * v_out) {
+    if (g_qkv.model == 0) return false;
+    const size_t h_sz = 1024 * 4, n_sz = 1024 * 4;
+    const size_t qw_sz = (size_t)1024 * 1024 * 4, kw_sz = (size_t)1024 * 512 * 4;
+    const size_t q_sz = 1024 * 4, k_sz = 512 * 4, v_sz = 512 * 4;
+
+    // upload activation (hidden); stage weights once
+    float h_buf[1024];
+    if (hidden->type == GGML_TYPE_F32) memcpy(h_buf, hidden->data, h_sz);
+    else {
+        const auto * tr = ggml_get_type_traits(hidden->type);
+        if (!tr || !tr->to_float) return false;
+        tr->to_float(hidden->data, h_buf, 1024);
+    }
+    axclrtMemcpy(g_qkv.dev_in[0], h_buf, h_sz, AXCL_MEMCPY_HOST_TO_DEVICE);
+    axclrtMemcpy(g_qkv.dev_in[1], norm_w->data, n_sz, AXCL_MEMCPY_HOST_TO_DEVICE);
+
+    void * dqw = axcl_fused_stage_w(&g_qkv, q_w, qw_sz);
+    void * dkw = axcl_fused_stage_w(&g_qkv, k_w, kw_sz);
+    void * dvw = axcl_fused_stage_w(&g_qkv, v_w, kw_sz);
+    if (!dqw || !dkw || !dvw) return false;
+    // NOTE: staged weights are already in their own CMM buffers; we bind them
+    // as inputs via SetInputBufferByIndex below
+
+    // bind inputs (activation in pre-allocated, weights in staged buffers)
+    axclrtEngineSetInputBufferByIndex(g_qkv.io, 0, g_qkv.dev_in[0], h_sz);
+    axclrtEngineSetInputBufferByIndex(g_qkv.io, 1, g_qkv.dev_in[1], n_sz);
+    axclrtEngineSetInputBufferByIndex(g_qkv.io, 2, dqw, qw_sz);
+    axclrtEngineSetInputBufferByIndex(g_qkv.io, 3, dkw, kw_sz);
+    axclrtEngineSetInputBufferByIndex(g_qkv.io, 4, dvw, kw_sz);
+    axclrtEngineSetOutputBufferByIndex(g_qkv.io, 0, g_qkv.dev_out[0], q_sz);
+    axclrtEngineSetOutputBufferByIndex(g_qkv.io, 1, g_qkv.dev_out[1], k_sz);
+    axclrtEngineSetOutputBufferByIndex(g_qkv.io, 2, g_qkv.dev_out[2], v_sz);
+
+    if (axclrtEngineExecute(g_qkv.model, g_qkv.ectx, 0, g_qkv.io) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: QKV engine execute failed\n");
+        return false;
+    }
+
+    axclrtMemcpy(q_out, g_qkv.dev_out[0], q_sz, AXCL_MEMCPY_DEVICE_TO_HOST);
+    axclrtMemcpy(k_out, g_qkv.dev_out[1], k_sz, AXCL_MEMCPY_DEVICE_TO_HOST);
+    axclrtMemcpy(v_out, g_qkv.dev_out[2], v_sz, AXCL_MEMCPY_DEVICE_TO_HOST);
+    return true;
+}
+
+// execute the gate+up fused engine
+static bool axcl_gate_up_run(struct ggml_tensor * h, struct ggml_tensor * gate_w, struct ggml_tensor * up_w,
+                             float * gate_out, float * up_out) {
+    if (g_gate_up.model == 0) return false;
+    const size_t h_sz = 1024 * 4;
+    const size_t gw_sz = (size_t)1024 * 3072 * 4;
+    const size_t o_sz = 3072 * 4;
+
+    float h_buf[1024];
+    if (h->type == GGML_TYPE_F32) memcpy(h_buf, h->data, h_sz);
+    else {
+        const auto * tr = ggml_get_type_traits(h->type);
+        if (!tr || !tr->to_float) return false;
+        tr->to_float(h->data, h_buf, 1024);
+    }
+    axclrtMemcpy(g_gate_up.dev_in[0], h_buf, h_sz, AXCL_MEMCPY_HOST_TO_DEVICE);
+
+    void * dgw = axcl_fused_stage_w(&g_gate_up, gate_w, gw_sz);
+    void * duw = axcl_fused_stage_w(&g_gate_up, up_w, gw_sz);
+    if (!dgw || !duw) return false;
+
+    axclrtEngineSetInputBufferByIndex(g_gate_up.io, 0, g_gate_up.dev_in[0], h_sz);
+    axclrtEngineSetInputBufferByIndex(g_gate_up.io, 1, dgw, gw_sz);
+    axclrtEngineSetInputBufferByIndex(g_gate_up.io, 2, duw, gw_sz);
+    axclrtEngineSetOutputBufferByIndex(g_gate_up.io, 0, g_gate_up.dev_out[0], o_sz);
+    axclrtEngineSetOutputBufferByIndex(g_gate_up.io, 1, g_gate_up.dev_out[1], o_sz);
+
+    if (axclrtEngineExecute(g_gate_up.model, g_gate_up.ectx, 0, g_gate_up.io) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: gate+up engine execute failed\n");
+        return false;
+    }
+
+    axclrtMemcpy(gate_out, g_gate_up.dev_out[0], o_sz, AXCL_MEMCPY_DEVICE_TO_HOST);
+    axclrtMemcpy(up_out, g_gate_up.dev_out[1], o_sz, AXCL_MEMCPY_DEVICE_TO_HOST);
+    return true;
+}
+
 static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_axcl_context * ctx = (ggml_backend_axcl_context *) backend->context;
     axclrtSetDevice(axcl_get_device_index(ctx->device));
@@ -977,7 +1129,54 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
     struct ggml_tensor * attn_k = nullptr, * attn_q = nullptr, * attn_dst = nullptr;
     int attn_state = 0; // 0=idle, 1=buffered q@k waiting for @v
 
+    // PRE-PASS: detect and execute fused engine patterns (QKV, gate+up).
+    // Nodes consumed by fused engines are added to `done` and skipped below.
+    std::unordered_set<int> done;
+    {
+        for (int i = 0; i + 3 < cgraph->n_nodes; i++) {
+            struct ggml_tensor * n0 = cgraph->nodes[i];
+
+            // Pattern 1: RMS_NORM → Q_proj → K_proj → V_proj (4 consecutive)
+            if (n0->op == GGML_OP_RMS_NORM && g_qkv.model != 0) {
+                struct ggml_tensor * n1 = cgraph->nodes[i+1];
+                struct ggml_tensor * n2 = cgraph->nodes[i+2];
+                struct ggml_tensor * n3 = cgraph->nodes[i+3];
+                if (n1->op == GGML_OP_MUL_MAT && n2->op == GGML_OP_MUL_MAT && n3->op == GGML_OP_MUL_MAT &&
+                    n1->src[1] == n0 && n2->src[1] == n0 && n3->src[1] == n0 &&
+                    n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 1024 &&
+                    n2->src[0]->ne[0] == 1024 && n2->src[0]->ne[1] == 512 &&
+                    n3->src[0]->ne[0] == 1024 && n3->src[0]->ne[1] == 512) {
+                    // found QKV pattern: execute fused engine
+                    if (axcl_qkv_run(n0->src[0], n0->src[1],
+                                     n1->src[0], n2->src[0], n3->src[0],
+                                     (float *) n1->data, (float *) n2->data, (float *) n3->data)) {
+                        done.insert(i); done.insert(i+1); done.insert(i+2); done.insert(i+3);
+                        fprintf(stderr, "[axcl-fuse] QKV pattern at node %d -> 1 engine call\n", i);
+                        i += 3; // skip past
+                    }
+                }
+            }
+
+            // Pattern 2: gate_proj + up_proj (2 consecutive MUL_MATs sharing src1)
+            if (n0->op == GGML_OP_MUL_MAT && g_gate_up.model != 0 && i + 1 < cgraph->n_nodes) {
+                struct ggml_tensor * n1 = cgraph->nodes[i+1];
+                if (n1->op == GGML_OP_MUL_MAT && n1->src[1] == n0->src[1] &&
+                    n0->src[0]->ne[0] == 1024 && n0->src[0]->ne[1] == 3072 &&
+                    n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 3072 &&
+                    !done.count(i) && !done.count(i+1)) {
+                    if (axcl_gate_up_run(n0->src[1], n0->src[0], n1->src[0],
+                                          (float *) n0->data, (float *) n1->data)) {
+                        done.insert(i); done.insert(i+1);
+                        fprintf(stderr, "[axcl-fuse] gate+up pattern at node %d -> 1 engine call\n", i);
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (done.count(i)) continue; // already computed by a fused engine
         struct ggml_tensor * node = cgraph->nodes[i];
 
         if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW ||
@@ -1090,6 +1289,23 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
         axcl_preload_all_engines(); // outside the activation mutex
         axcl_weight_pool_init();
         axcl_attn_load();
+        // QKV fused engine: rms_norm(hidden) -> q, k, v in one call
+        if (axcl_fused_load(&g_qkv, "/usr/local/share/ggml-axcl/qkv_h1024_kv512.axmodel",
+                            {"hidden", "norm_w", "q_w", "k_w", "v_w"}, {"q", "k", "v"})) {
+            // sizes: hidden 4KB, norm 4KB, q_w 4MB, k_w 2MB, v_w 2MB; q 4KB, k 2KB, v 2KB
+            axcl_fused_alloc(&g_qkv,
+                {1024*4, 1024*4, (size_t)1024*1024*4, (size_t)1024*512*4, (size_t)1024*512*4},
+                {1024*4, 512*4, 512*4});
+            GGML_LOG_INFO("ggml-axcl: QKV fused engine loaded\n");
+        }
+        // gate+up fused engine: h @ gate_w, h @ up_w in one call
+        if (axcl_fused_load(&g_gate_up, "/usr/local/share/ggml-axcl/gate_up_h1024_i3072.axmodel",
+                            {"h", "gate_w", "up_w"}, {"gate", "up"})) {
+            axcl_fused_alloc(&g_gate_up,
+                {1024*4, (size_t)1024*3072*4, (size_t)1024*3072*4},
+                {(size_t)3072*4, (size_t)3072*4});
+            GGML_LOG_INFO("ggml-axcl: gate+up fused engine loaded\n");
+        }
     }
     // translate ordinal to the real slot index via the activation probe
     int32_t slot = axcl_get_device_index(device);
