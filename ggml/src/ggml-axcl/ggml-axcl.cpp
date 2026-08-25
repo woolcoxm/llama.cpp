@@ -794,6 +794,27 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             }
             break;
         }
+        case GGML_OP_GET_ROWS: {
+            // out[r, :] = rows(src0)[ src1[r] ] (dequant if needed)
+            const int64_t * ids = (const int64_t *) src1->data;
+            const int64_t   nc  = src0->ne[0];
+            const struct ggml_type_traits * tr = ggml_get_type_traits(src0->type);
+            GGML_ASSERT(tr && tr->to_float);
+            std::vector<float> rowbuf(nc);
+            for (int64_t r = 0; r < node->ne[1]; r++) {
+                int64_t id = ids[r];
+                GGML_ASSERT(id >= 0 && id < src0->ne[1]);
+                const void * srcrow = (const char *) src0->data + (size_t) id * src0->nb[1];
+                float * drow = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
+                if (src0->type == GGML_TYPE_F32) {
+                    memcpy(drow, srcrow, (size_t) nc * 4);
+                } else {
+                    tr->to_float(srcrow, rowbuf.data(), nc);
+                    memcpy(drow, rowbuf.data(), (size_t) nc * 4);
+                }
+            }
+            break;
+        }
         default:
             return false;
     }
@@ -994,6 +1015,11 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_CPY:
         case GGML_OP_DUP:
             return op->type == GGML_TYPE_F32;
+        case GGML_OP_GET_ROWS:
+            // embedding lookup from weights living in our buffer; without
+            // accepting it the scheduler aborts (no backend pairs our buft
+            // with this op)
+            return true;
         default:
             break;
     }
