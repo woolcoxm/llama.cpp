@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -277,6 +278,8 @@ struct axcl_matmul {
     std::vector<float> x_h, w_h, y_h;    // host staging
 };
 
+static void axcl_preload_all_engines();
+
 static bool axcl_engine_global_init() {
     static bool initialized = false;
     static bool available   = false;
@@ -299,6 +302,9 @@ static bool axcl_engine_global_init() {
             GGML_LOG_ERROR("ggml-axcl: engine activation failed with %d\n", (int) err);
         }
         initialized = true;
+    }
+    if (available) {
+        axcl_preload_all_engines();
     }
     return available;
 }
@@ -390,32 +396,79 @@ static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
     return mm;
 }
 
-// shape-keyed cache with negative-result memoization
+// shape-keyed engine cache; after preload it is final (no IO on hot paths)
+struct axcl_matmul_cache_t {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, axcl_matmul *> engines; // key: (k << 32) | n
+    std::unordered_map<uint64_t, bool>        missing;
+    bool                                       preloaded = false;
+};
+
+static axcl_matmul_cache_t * axcl_matmul_cache() {
+    static axcl_matmul_cache_t cache;
+    return &cache;
+}
+
 static axcl_matmul * axcl_matmul_get(int64_t k, int64_t n) {
-    struct Cache {
-        std::mutex mutex;
-        std::unordered_map<uint64_t, axcl_matmul *> engines; // key: (k << 32) | n
-        std::unordered_map<uint64_t, bool>        missing;
-    };
-    static Cache cache;
+    axcl_matmul_cache_t * cache = axcl_matmul_cache();
 
     const uint64_t key = ((uint64_t) k << 32) | (uint32_t) n;
 
-    std::lock_guard<std::mutex> lock(cache.mutex);
-    auto it = cache.engines.find(key);
-    if (it != cache.engines.end()) {
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    auto it = cache->engines.find(key);
+    if (it != cache->engines.end()) {
         return it->second;
     }
-    if (cache.missing.count(key)) {
-        return nullptr;
+    if (cache->missing.count(key) || cache->preloaded) {
+        return nullptr; // after preload the cache is final: no IO on hot paths
     }
     axcl_matmul * mm = axcl_matmul_load(k, n);
     if (mm) {
-        cache.engines[key] = mm;
+        cache->engines[key] = mm;
     } else {
-        cache.missing[key] = true;
+        cache->missing[key] = true;
     }
     return mm;
+}
+
+// load every matmul_m1_k*_n*.axmodel in AXCL_MATMUL_DIR once, at backend
+// startup. Engine loads touch the card (LoadFromFile/CreateIO/CMM) and
+// must never race a concurrent Execute - the scheduler probes supports_op
+// from its own thread mid-graph, which deadlocked the runtime
+static void axcl_preload_all_engines() {
+    axcl_matmul_cache_t * cache = axcl_matmul_cache();
+    std::lock_guard<std::mutex> lock(cache->mutex);
+    if (cache->preloaded) {
+        return;
+    }
+    cache->preloaded = true;
+
+    const char * dir = getenv("AXCL_MATMUL_DIR");
+    std::string d = dir ? dir : "/usr/local/share/ggml-axcl/matmul";
+    DIR * dp = opendir(d.c_str());
+    if (!dp) {
+        return;
+    }
+    struct dirent * de;
+    int loaded = 0;
+    while ((de = readdir(dp)) != nullptr) {
+        int64_t k, n;
+        if (sscanf(de->d_name, "matmul_m1_k%lld_n%lld.axmodel", (long long *) &k, (long long *) &n) == 2) {
+            const uint64_t key = ((uint64_t) k << 32) | (uint32_t) n;
+            if (cache->engines.count(key) || cache->missing.count(key)) {
+                continue;
+            }
+            axcl_matmul * mm = axcl_matmul_load(k, n);
+            if (mm) {
+                cache->engines[key] = mm;
+                loaded++;
+            } else {
+                cache->missing[key] = true;
+            }
+        }
+    }
+    closedir(dp);
+    GGML_LOG_INFO("ggml-axcl: preloaded %d matmul engines from %s\n", loaded, d.c_str());
 }
 
 // dequantize src0 (ggml weight, [K x N] row-major, ne0 = K) into a
