@@ -1057,19 +1057,27 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             break;
         }
         case GGML_OP_SET_ROWS: {
+            if (!src0 || !src0->data || !node || !node->data || !src1 || !src1->data) break;
             const struct ggml_tensor * ids = src1;
             const int64_t nc = src0->ne[0];
             const int64_t nr = ggml_nrows(src0);
+            const size_t node_bytes = ggml_nbytes(node);
             for (int64_t r = 0; r < nr; r++) {
-                int32_t id;
+                int64_t id = 0;
                 if (ids->type == GGML_TYPE_I32) {
-                    id = *(const int32_t *)((const char *)ids->data + (size_t)r * ids->nb[1]);
-                } else {
-                    id = (int32_t)(*(const int64_t *)((const char *)ids->data + (size_t)r * ids->nb[1]));
+                    id = *(const int32_t *)((const char *)ids->data + (size_t)r * ids->nb[0]);
+                } else if (ids->type == GGML_TYPE_I64) {
+                    id = *(const int64_t *)((const char *)ids->data + (size_t)r * ids->nb[0]);
                 }
-                const float * sr = (const float *)((char *)src0->data + axcl_row_off(src0, r));
-                float * drow = (float *)((char *)node->data + (size_t)id * node->nb[1]);
-                memcpy(drow, sr, (size_t)nc * 4);
+                if (id < 0 || (size_t)((size_t)id * node->nb[1] + (size_t)nc * 4) > node_bytes) continue;
+                size_t sr_off = axcl_row_off(src0, r);
+                if (sr_off + (size_t)nc * 4 > ggml_nbytes(src0)) continue;
+                const float * sr = (const float *)((char *)src0->data + sr_off);
+                char * drow = (char *)node->data + (size_t)id * node->nb[1];
+                size_t remain = node_bytes - (size_t)(drow - (char *)node->data);
+                size_t cp = (size_t)nc * 4;
+                if (cp > remain) cp = remain;
+                if (cp > 0) memcpy(drow, sr, cp);
             }
             break;
         }
@@ -1412,8 +1420,6 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     return GGML_STATUS_ABORTED;
                 }
             } else {
-                fprintf(stderr, "[axcl-unmatched] k=%lld n=%lld ne2=%lld\n",
-                        (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2]);
                 // per-head attention matmuls (3D with ne[2]>1 for heads):
                 // q@k: ne[0]=seq(growing), ne[1]=128(head_dim), ne[2]=8(kv_heads)
                 // @v:  ne[0]=128(head_dim), ne[1]=seq(growing), ne[2]=8(kv_heads)
