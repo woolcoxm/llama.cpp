@@ -824,8 +824,11 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             const int64_t nrq = node->ne[1];
             const int64_t nc  = src0->ne[0];
             const struct ggml_type_traits * tr = ggml_get_type_traits(src0->type);
-            GGML_ASSERT(tr && tr->to_float);
             std::vector<float> rowbuf(nc);
+            if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 &&
+                src0->type != GGML_TYPE_BF16) {
+                GGML_ASSERT(tr && tr->to_float);
+            }
             for (int64_t r = 0; r < nrq; r++) {
                 int64_t id;
                 if (src1->type == GGML_TYPE_I32) {
