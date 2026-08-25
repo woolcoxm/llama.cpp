@@ -885,15 +885,25 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         }
         if (node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor * src0 = node->src[0];
+            struct ggml_tensor * src1 = node->src[1];
             axcl_matmul *        mm   = axcl_matmul_get(src0->ne[0], src0->ne[1]);
-            if (mm == nullptr) {
-                GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT k=%lld n=%lld has no engine\n", i,
-                               (long long) src0->ne[0], (long long) src0->ne[1]);
-                return GGML_STATUS_ABORTED;
-            }
-            if (!ggml_axcl_compute_mul_mat(mm, src0, node->src[1], node)) {
-                GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT failed\n", i);
-                return GGML_STATUS_ABORTED;
+            if (mm != nullptr) {
+                if (!ggml_axcl_compute_mul_mat(mm, src0, src1, node)) {
+                    GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT failed\n", i);
+                    return GGML_STATUS_ABORTED;
+                }
+            } else {
+                // host-side attention matmul: dst[n] = sum_k src0[n,k]*x[k]
+                const int64_t k = src0->ne[0], n = src0->ne[1];
+                const float * x = (const float *) src1->data;
+                float *       d = (float *) node->data;
+                for (int64_t nn = 0; nn < n; nn++) {
+                    const float * w = (const float *) ((const char *) src0->data + (size_t) nn * src0->nb[1]);
+                    float acc = 0.0f;
+                    for (int64_t kk = 0; kk < k; kk++) acc += w[kk] * x[kk];
+                    d[nn] = acc;
+                }
+                prof_hostops++;
             }
         } else {
             fprintf(stderr, "[axcl-dbg] node %d op %s NOT SUPPORTED\n", i, ggml_op_name(node->op));
@@ -1114,8 +1124,18 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
     if (src1->ne[1] != 1) {
         return false; // decode only (M == 1); prefill stays on CPU
     }
-    // engine must exist for this (K, N)
-    return axcl_matmul_get(src0->ne[0], src0->ne[1]) != nullptr;
+    // engine path
+    if (axcl_matmul_get(src0->ne[0], src0->ne[1]) != nullptr) {
+        return true;
+    }
+    // no engine: run attention-sized dynamic-shape matmuls host-side so the
+    // scheduler never splits the attention block to CPU (each split costs
+    // ~3ms dispatch; there are ~9 per layer at batch-1)
+    if (src1->ne[1] == 1 && src0->type == GGML_TYPE_F32) {
+        const int64_t k = src0->ne[0], n = src0->ne[1];
+        return k <= 4096 && n <= 8192; // q@k^T etc: n grows with context
+    }
+    return false;
 }
 
 static bool ggml_backend_axcl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
