@@ -1083,6 +1083,32 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             }
             break;
         }
+        case GGML_OP_CONT: {
+            // stride-aware contiguous copy: src0 may be a permuted/transposed view
+            // (raw memcpy would read wrong data from non-contiguous layouts)
+            if (!src0 || !src0->data || !node->data) break;
+            const int64_t ne0 = node->ne[0], ne1 = node->ne[1];
+            const int64_t ne2 = node->ne[2], ne3 = node->ne[3];
+            for (int64_t j3 = 0; j3 < ne3; j3++) {
+                for (int64_t j2 = 0; j2 < ne2; j2++) {
+                    for (int64_t j1 = 0; j1 < ne1; j1++) {
+                        const char * s = (const char *) src0->data +
+                            (size_t)j1 * src0->nb[1] + (size_t)j2 * src0->nb[2] + (size_t)j3 * src0->nb[3];
+                        char * d = (char *) node->data +
+                            (size_t)j1 * node->nb[1] + (size_t)j2 * node->nb[2] + (size_t)j3 * node->nb[3];
+                        // inner row: ne0 elements with stride nb[0]
+                        if (src0->nb[0] == 4) {
+                            memcpy(d, s, (size_t) ne0 * 4);
+                        } else {
+                            for (int64_t j0 = 0; j0 < ne0; j0++) {
+                                memcpy(d + j0 * 4, s + j0 * src0->nb[0], 4);
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
         case GGML_OP_DIAG_MASK_INF: {
             // in-place on attention scores: set positions >= n_past to -inf
             // op_params layout varies by version; read first 4 bytes as int
