@@ -337,6 +337,106 @@ struct axcl_weight_pool {
 };
 static axcl_weight_pool g_axcl_pool;
 
+// fused attention engine: softmax(q*K^T*scale + mask)*V for all heads
+// in one NPU execute (mixed precision, GQA via host-side head repeat)
+struct axcl_attn_engine {
+    uint64_t model = 0, ectx = 0;
+    axclrtEngineIOInfo info = nullptr;
+    axclrtEngineIO     io   = nullptr;
+    void * dq = nullptr, * dk = nullptr, * dv = nullptr, * dm = nullptr, * dout = nullptr;
+    int iq = -1, ik = -1, iv = -1, im = -1, iout = -1;
+    int h_q = 16, h_kv = 8, d = 64, t = 512;
+    std::vector<float> q_buf, k_buf, v_buf, m_buf, out_buf; // host staging
+};
+static axcl_attn_engine g_attn;
+
+static void axcl_attn_load() {
+    if (g_attn.model != 0) return;
+    const char * env = getenv("AXCL_ATTN_MODEL");
+    const char * path = env ? env : "/usr/local/share/ggml-axcl/attn_h16_d64_t512.axmodel";
+    FILE * f = fopen(path, "r");
+    if (!f) return;
+    fclose(f);
+    if (axclrtEngineLoadFromFile(path, &g_attn.model) != AXCL_SUCC) {
+        g_attn.model = 0;
+        return;
+    }
+    axclrtEngineGetIOInfo(g_attn.model, &g_attn.info);
+    axclrtEngineCreateIO(g_attn.info, &g_attn.io);
+    axclrtEngineCreateContext(g_attn.model, &g_attn.ectx);
+    g_attn.iq   = axclrtEngineGetInputIndexByName(g_attn.info, "Q");
+    g_attn.ik   = axclrtEngineGetInputIndexByName(g_attn.info, "K");
+    g_attn.iv   = axclrtEngineGetInputIndexByName(g_attn.info, "V");
+    g_attn.im   = axclrtEngineGetInputIndexByName(g_attn.info, "mask");
+    g_attn.iout = axclrtEngineGetOutputIndexByName(g_attn.info, "out");
+
+    const int HQ = g_attn.h_q, D = g_attn.d, T = g_attn.t;
+    axclrtMalloc(&g_attn.dq,   HQ * D * 4, AXCL_MEM_MALLOC_HUGE_FIRST);
+    axclrtMalloc(&g_attn.dk, (size_t) HQ * T * D * 4, AXCL_MEM_MALLOC_HUGE_FIRST);
+    axclrtMalloc(&g_attn.dv, (size_t) HQ * T * D * 4, AXCL_MEM_MALLOC_HUGE_FIRST);
+    axclrtMalloc(&g_attn.dm,   T * 4, AXCL_MEM_MALLOC_HUGE_FIRST);
+    axclrtMalloc(&g_attn.dout, HQ * D * 4, AXCL_MEM_MALLOC_HUGE_FIRST);
+    g_attn.q_buf.resize(HQ * D);
+    g_attn.k_buf.resize((size_t) HQ * T * D);
+    g_attn.v_buf.resize((size_t) HQ * T * D);
+    g_attn.m_buf.resize(T);
+    g_attn.out_buf.resize(HQ * D);
+    GGML_LOG_INFO("ggml-axcl: attention engine loaded (%s)\n", path);
+}
+
+// run one fused attention call: repack + upload + execute + download
+static bool axcl_attn_run(const float * q, const float * k_cache, const float * v_cache,
+                          size_t k_nb1, size_t v_nb1, int seq, int n_kv_heads, int head_dim,
+                          float * out) {
+    if (g_attn.model == 0) return false;
+    const int HQ = g_attn.h_q, D = g_attn.d, T = g_attn.t;
+    const int G = HQ / n_kv_heads;
+    if ((int) head_dim != D || seq > T) return false;
+
+    // repack Q: [n_embd] -> [HQ, D] (identity reshape)
+    memcpy(g_attn.q_buf.data(), q, (size_t) HQ * D * 4);
+
+    // repack K/V: from cache [n_kv_heads*D, n_ctx] to [HQ, T, D] with GQA repeat
+    for (int h = 0; h < HQ; h++) {
+        int hk = h / G;
+        for (int t = 0; t < T; t++) {
+            if (t < seq) {
+                const char * ksrc = (const char *) k_cache + (size_t) (hk * D) * 4 + (size_t) t * k_nb1;
+                const char * vsrc = (const char *) v_cache + (size_t) (hk * D) * 4 + (size_t) t * v_nb1;
+                memcpy(&g_attn.k_buf[((size_t) h * T + t) * D], ksrc, (size_t) D * 4);
+                memcpy(&g_attn.v_buf[((size_t) h * T + t) * D], vsrc, (size_t) D * 4);
+            } else {
+                memset(&g_attn.k_buf[((size_t) h * T + t) * D], 0, (size_t) D * 4);
+                memset(&g_attn.v_buf[((size_t) h * T + t) * D], 0, (size_t) D * 4);
+            }
+        }
+    }
+
+    // mask: 0 for valid, -1e9 beyond
+    for (int t = 0; t < T; t++) g_attn.m_buf[t] = (t < seq) ? 0.0f : -1e9f;
+
+    // upload + execute + download
+    axclrtMemcpy(g_attn.dq, g_attn.q_buf.data(), (size_t) HQ * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+    axclrtMemcpy(g_attn.dk, g_attn.k_buf.data(), (size_t) HQ * T * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+    axclrtMemcpy(g_attn.dv, g_attn.v_buf.data(), (size_t) HQ * T * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+    axclrtMemcpy(g_attn.dm, g_attn.m_buf.data(), T * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+
+    axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iq, g_attn.dq, (size_t) HQ * D * 4);
+    axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.ik, g_attn.dk, (size_t) HQ * T * D * 4);
+    axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iv, g_attn.dv, (size_t) HQ * T * D * 4);
+    axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.im, g_attn.dm, T * 4);
+    axclrtEngineSetOutputBufferByIndex(g_attn.io, g_attn.iout, g_attn.dout, (size_t) HQ * D * 4);
+
+    if (axclrtEngineExecute(g_attn.model, g_attn.ectx, 0, g_attn.io) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: attention engine execute failed\n");
+        return false;
+    }
+
+    axclrtMemcpy(g_attn.out_buf.data(), g_attn.dout, (size_t) HQ * D * 4, AXCL_MEMCPY_DEVICE_TO_HOST);
+    memcpy(out, g_attn.out_buf.data(), (size_t) HQ * D * 4);
+    return true;
+}
+
 static void axcl_weight_pool_init() {
     fprintf(stderr, "[axcl-pool] pool_init called\n");
     if (g_axcl_pool.base != nullptr) {
@@ -873,6 +973,10 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         axclrtSetCurrentContext(g_axcl_ctx); // contexts are thread-local: bind worker threads
     }
 
+    // fused-attention buffer state
+    struct ggml_tensor * attn_k = nullptr, * attn_q = nullptr, * attn_dst = nullptr;
+    int attn_state = 0; // 0=idle, 1=buffered q@k waiting for @v
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
@@ -892,8 +996,50 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT failed\n", i);
                     return GGML_STATUS_ABORTED;
                 }
+            } else if (g_attn.model != 0 && src1->ne[1] == 1 &&
+                       src0->ne[0] <= 128 && src0->ne[2] == 1) {
+                // attention matmul: buffer for the fused engine call.
+                // q@k^T has k=head_dim, n=seq; @v has k=seq, n=head_dim.
+                // both are small with src1->ne[1]==1 (batch-1 generation)
+                if (attn_state == 0) {
+                    // q@k^T: src0=K_cache [head_dim, seq], src1=Q [embd, 1]
+                    attn_k = src0; attn_q = src1; attn_dst = node;
+                    attn_state = 1; // waiting for @v
+                    // NOTE: we skip computing this node - the engine will
+                    // produce the final output at the @v step
+                } else if (attn_state == 1) {
+                    // @v: src0=V_cache [seq, head_dim], src1=attention_weights
+                    // run the fused engine: Q,K,V -> out
+                    int n_kv = (int) attn_k->ne[1]; // seq length
+                    if (n_kv <= g_attn.t) {
+                        if (axcl_attn_run(
+                                (const float *) attn_q->data,
+                                (const float *) attn_k->data,
+                                (const float *) src0->data,
+                                attn_k->nb[1], src0->nb[1],
+                                n_kv, 8, 64, // n_kv_heads=8, head_dim=64 (Qwen3-0.6B GQA)
+                                (float *) node->data)) {
+                            prof_hostops++;
+                            attn_state = 0;
+                            continue; // done: skip the scalar loops
+                        }
+                    }
+                    // engine unavailable or failed: fall through to scalar
+                    attn_state = 0;
+                }
+                // scalar fallback
+                const int64_t k = src0->ne[0], n = src0->ne[1];
+                const float * x = (const float *) src1->data;
+                float *       d = (float *) node->data;
+                for (int64_t nn = 0; nn < n; nn++) {
+                    const float * w = (const float *) ((const char *) src0->data + (size_t) nn * src0->nb[1]);
+                    float acc = 0.0f;
+                    for (int64_t kk = 0; kk < k; kk++) acc += w[kk] * x[kk];
+                    d[nn] = acc;
+                }
+                prof_hostops++;
             } else {
-                // host-side attention matmul: dst[n] = sum_k src0[n,k]*x[k]
+                // non-attention small matmul: scalar fallback
                 const int64_t k = src0->ne[0], n = src0->ne[1];
                 const float * x = (const float *) src1->data;
                 float *       d = (float *) node->data;
@@ -943,6 +1089,7 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
     if (axcl_engine_global_init()) {
         axcl_preload_all_engines(); // outside the activation mutex
         axcl_weight_pool_init();
+        axcl_attn_load();
     }
     // translate ordinal to the real slot index via the activation probe
     int32_t slot = axcl_get_device_index(device);
