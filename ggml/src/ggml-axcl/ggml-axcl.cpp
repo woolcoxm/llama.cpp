@@ -280,6 +280,8 @@ struct axcl_matmul {
 
 static void axcl_preload_all_engines();
 
+static axclrtContext g_axcl_ctx = 0; // thread-local bind target for worker threads
+
 static bool axcl_engine_global_init() {
     static bool initialized = false;
     static bool available   = false;
@@ -294,6 +296,7 @@ static bool axcl_engine_global_init() {
         axclrtContext ctx = 0;
         axclError  err  = axclrtCreateContext(&ctx, dev);
         if (err == AXCL_SUCC) {
+            g_axcl_ctx = ctx;
             axclrtSetCurrentContext(ctx);
             err = axclrtEngineInit(AXCL_VNPU_DISABLE);
         }
@@ -564,7 +567,10 @@ static void ggml_backend_axcl_free(ggml_backend_t backend) {
 
 static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_axcl_context * ctx = (ggml_backend_axcl_context *) backend->context;
-    axclrtSetDevice(ctx->device);
+    axclrtSetDevice(axcl_get_device_index(ctx->device));
+    if (g_axcl_ctx) {
+        axclrtSetCurrentContext(g_axcl_ctx); // contexts are thread-local: bind worker threads
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
