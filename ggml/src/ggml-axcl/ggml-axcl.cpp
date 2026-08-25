@@ -113,9 +113,10 @@ static std::string axcl_get_device_description(int32_t device) {
 
 struct ggml_backend_axcl_buffer_context {
     int32_t device;
-    void *  ptr;   // plain host memory: CMM pointers are NOT cpu-dereferenceable,
-    size_t  size;  // so ggml-visible buffers stay in host RAM; the matmul
-};                  // engines stage through CMM internally via axclrtMemcpy
+    void *  ptr;
+    size_t  size;
+    bool    is_cmm = false;  // true when ptr is card memory (axclrtMalloc)
+};
 
 static void ggml_backend_axcl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_axcl_buffer_context * ctx = (ggml_backend_axcl_buffer_context *) buffer->context;
@@ -136,14 +137,24 @@ static void ggml_backend_axcl_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_axcl_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                 const void * data, size_t offset, size_t size) {
-    GGML_UNUSED(buffer);
-    memcpy((char *) tensor->data + offset, data, size);
+    ggml_backend_axcl_buffer_context * ctx = (ggml_backend_axcl_buffer_context *) buffer->context;
+    char * dst = (char *) tensor->data + offset;
+    if (ctx && ctx->is_cmm) {
+        axclrtMemcpy(dst, data, size, AXCL_MEMCPY_HOST_TO_DEVICE);
+    } else {
+        memcpy(dst, data, size);
+    }
 }
 
 static void ggml_backend_axcl_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
                                                 void * data, size_t offset, size_t size) {
-    GGML_UNUSED(buffer);
-    memcpy(data, (const char *) tensor->data + offset, size);
+    ggml_backend_axcl_buffer_context * ctx = (ggml_backend_axcl_buffer_context *) buffer->context;
+    const char * src = (const char *) tensor->data + offset;
+    if (ctx && ctx->is_cmm) {
+        axclrtMemcpy(data, src, size, AXCL_MEMCPY_DEVICE_TO_HOST);
+    } else {
+        memcpy(data, src, size);
+    }
 }
 
 static bool ggml_backend_axcl_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src,
@@ -1549,11 +1560,9 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_SET_ROWS:
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_FLASH_ATTN_EXT:
-            // disabled: the KV cache lives in CPU-backend memory, so the
-            // scheduler keeps the whole attention block on CPU regardless.
-            // enabling these just adds slow host-side ops without routing
-            // attention to the NPU engine
-            return false;
+            // claim the full attention block: with the KV cache allocated
+            // in our buffer, the scheduler routes attention to us
+            return true;
         case GGML_OP_GET_ROWS:
             return true;
         default:
