@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -287,6 +288,28 @@ static void axcl_preload_all_engines();
 
 static axclrtContext g_axcl_ctx = 0; // thread-local bind target for worker threads
 
+// stage profiling: micros accumulated per stage, reported every REPORT computes
+#include <cstdint>
+static uint64_t prof_stage_wstage = 0, prof_stage_xh2d = 0, prof_stage_bind = 0,
+                prof_stage_exec = 0, prof_stage_yd2h = 0, prof_stage_total = 0,
+                prof_wstaged = 0, prof_count = 0;
+#define PROF_REPORT_EVERY 120
+static void prof_report() {
+    if (prof_count % PROF_REPORT_EVERY != 0 || prof_count == 0) return;
+    fprintf(stderr,
+        "[axcl-prof] computes=%llu wstaged=%llu | avg micros/compute: total=%llu wstage=%llu xh2d=%llu bind=%llu exec=%llu yd2h=%llu other=%llu\n",
+        (unsigned long long) prof_count, (unsigned long long) prof_wstaged,
+        (unsigned long long) (prof_stage_total / prof_count),
+        (unsigned long long) (prof_stage_wstage / prof_count),
+        (unsigned long long) (prof_stage_xh2d / prof_count),
+        (unsigned long long) (prof_stage_bind / prof_count),
+        (unsigned long long) (prof_stage_exec / prof_count),
+        (unsigned long long) (prof_stage_yd2h / prof_count),
+        (unsigned long long) ((prof_stage_total - prof_stage_wstage - prof_stage_xh2d -
+                               prof_stage_bind - prof_stage_exec - prof_stage_yd2h) / prof_count));
+    fflush(stderr);
+}
+
 // card-resident weight pool: ONE CMM allocation carved bump-style so weights
 // upload exactly once (verified tolerable by test_pool: single malloc +
 // carved slots + interleaved executes). Falls back to per-call upload when
@@ -310,6 +333,7 @@ struct axcl_weight_pool {
 static axcl_weight_pool g_axcl_pool;
 
 static void axcl_weight_pool_init() {
+    fprintf(stderr, "[axcl-pool] pool_init called\n");
     if (g_axcl_pool.base != nullptr) {
         return;
     }
@@ -324,6 +348,7 @@ static void axcl_weight_pool_init() {
         return;
     }
     g_axcl_pool.base = g_axcl_pool.bump = (char *) p;
+    fprintf(stderr, "[axcl-pool] pool alloc OK\n");
     g_axcl_pool.remain = mb * 1024 * 1024;
     GGML_LOG_INFO("ggml-axcl: weight pool ready (%zu MB)\n", mb);
 }
@@ -546,45 +571,81 @@ static void axcl_dequant_any_to_f32_transposed(const struct ggml_tensor * t, flo
 static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor * src0,
                                       const struct ggml_tensor * src1, struct ggml_tensor * dst) {
     std::lock_guard<std::mutex> exec_lock(axcl_exec_mutex);
+    auto t0 = std::chrono::steady_clock::now();
     const int64_t k = mm->k;
     const int64_t n = mm->n;
 
     // X: activation, src1 is [K, 1] f32 contiguous
-    fprintf(stderr, "[axcl-dbg]  stg1 x\n");
     memcpy(mm->x_h.data(), src1->data, (size_t) k * 4);
-    fprintf(stderr, "[axcl-dbg]  stg2 dequant\n");
 
-    axcl_dequant_any_to_f32_transposed(src0, mm->w_h.data());
-    fprintf(stderr, "[axcl-dbg]  stg3 h2d\n");
-
-    axclError e1 = axclrtMemcpy(mm->dx, mm->x_h.data(), (size_t) k * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-    axclError e2 = axclrtMemcpy(mm->dw, mm->w_h.data(), (size_t) k * n * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
-    fprintf(stderr, "[axcl-dbg]  stg4 bind\n");
-    if (e1 != AXCL_SUCC || e2 != AXCL_SUCC) {
-        GGML_LOG_ERROR("ggml-axcl: H2D copy failed\n");
-        return false;
+    // W: card-resident when staged, else one-time staging into the pool
+    void * dw = nullptr;
+    auto   wit = mm->dev_w.find(src0->data);
+    if (wit != mm->dev_w.end()) {
+        dw = wit->second;
+    }
+    bool w_uploaded = (dw != nullptr);
+    auto t1 = std::chrono::steady_clock::now();
+    if (!w_uploaded) {
+        if (mm->w_h.empty()) {
+            mm->w_h.resize(k * n);
+        }
+        axcl_dequant_any_to_f32_transposed(src0, mm->w_h.data());
+        void * slot = g_axcl_pool.carve((size_t) k * n * 4);
+        if (slot != nullptr &&
+            axclrtMemcpy(slot, mm->w_h.data(), (size_t) k * n * 4, AXCL_MEMCPY_HOST_TO_DEVICE) == AXCL_SUCC) {
+            mm->dev_w[src0->data] = slot;
+            dw = slot; // staged: future calls take the w_uploaded path
+        }
+        // pool miss (or H2D fail): dw stays null -> per-call upload below
     }
 
-    fprintf(stderr, "[axcl-dbg]  stg5 execute\n");
+    auto t2 = std::chrono::steady_clock::now();
+    if (axclrtMemcpy(mm->dx, mm->x_h.data(), (size_t) k * 4, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: X H2D failed\n");
+        return false;
+    }
+    if (!w_uploaded) {
+        if (axclrtMemcpy(mm->dw, mm->w_h.data(), (size_t) k * n * 4, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC) {
+            GGML_LOG_ERROR("ggml-axcl: W H2D failed\n");
+            return false;
+        }
+    }
+    auto t3 = std::chrono::steady_clock::now();
+
+    void * wbuf = w_uploaded ? dw : mm->dw;
     if (axclrtEngineSetInputBufferByIndex(mm->io, mm->x_idx, mm->dx, (size_t) k * 4) != AXCL_SUCC ||
-        axclrtEngineSetInputBufferByIndex(mm->io, mm->w_idx, mm->dw, (size_t) k * n * 4) != AXCL_SUCC ||
+        axclrtEngineSetInputBufferByIndex(mm->io, mm->w_idx, wbuf, (size_t) k * n * 4) != AXCL_SUCC ||
         axclrtEngineSetOutputBufferByIndex(mm->io, mm->y_idx, mm->dy, (size_t) n * 4) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: bind device buffers failed\n");
         return false;
     }
+    auto t4 = std::chrono::steady_clock::now();
 
     axclError ex = axclrtEngineExecute(mm->model_id, mm->context_id, 0, mm->io);
+    auto t5 = std::chrono::steady_clock::now();
     if (ex != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: engine execute failed\n");
         return false;
     }
 
-    // Y: f32 [N] device -> host -> dst
     if (axclrtMemcpy(mm->y_h.data(), mm->dy, (size_t) n * 4, AXCL_MEMCPY_DEVICE_TO_HOST) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: D2H copy failed\n");
         return false;
     }
     memcpy(dst->data, mm->y_h.data(), (size_t) n * 4);
+    auto t6 = std::chrono::steady_clock::now();
+
+    auto us = [](auto a, auto b) { return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count(); };
+    prof_stage_wstage += us(t0, t1) + us(t1, t2); // staging check + one-time upload
+    prof_stage_xh2d   += us(t2, t3);
+    prof_stage_bind   += us(t3, t4);
+    prof_stage_exec   += us(t4, t5);
+    prof_stage_yd2h   += us(t5, t6);
+    prof_stage_total  += us(t0, t6);
+    if (w_uploaded) prof_wstaged++;
+    prof_count++;
+    prof_report();
     return true;
 }
 
@@ -665,6 +726,7 @@ static const struct ggml_backend_i ggml_backend_axcl_interface = {
 };
 
 ggml_backend_t ggml_backend_axcl_init(int32_t device) {
+    fprintf(stderr, "[axcl-pool] backend_init entry\n");
     if (device < 0 || device >= axcl_get_device_count()) {
         GGML_LOG_ERROR("ggml-axcl: invalid device %d\n", device);
         return nullptr;
