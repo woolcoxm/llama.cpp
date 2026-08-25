@@ -692,7 +692,12 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
 }
 
 static bool ggml_backend_axcl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return dev == buft->device || (buft->iface.get_name(buft) == std::string_view("AXCL"));
+    GGML_UNUSED(dev);
+    GGML_UNUSED(buft);
+    // our compute path reads host memory directly (memcpy from t->data), so
+    // CPU-resident weights are fine - without this the scheduler never
+    // routes MUL_MAT to us when the model lives in host RAM
+    return true;
 }
 
 static bool ggml_backend_axcl_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
