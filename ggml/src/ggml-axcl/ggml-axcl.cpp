@@ -833,7 +833,9 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
                 } else {
                     id = ((const int64_t *) ((const char *) src1->data + (size_t) r * src1->nb[1]))[0];
                 }
-                GGML_ASSERT(id >= 0 && id < src0->ne[1]);
+                // views index beyond the view's row count into the parent
+                // (KV cache): address via nb[1] like the CPU kernel, no
+                // bounds check on ne[1]
                 const void * srcrow = (const char *) src0->data + (size_t) id * src0->nb[1];
                 float * drow = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
                 if (src0->type == GGML_TYPE_F32) {
