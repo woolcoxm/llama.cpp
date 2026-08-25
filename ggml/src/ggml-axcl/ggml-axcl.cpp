@@ -420,7 +420,7 @@ struct axcl_attn_engine {
     axclrtEngineIO     io   = nullptr;
     void * dq = nullptr, * dk = nullptr, * dv = nullptr, * dm = nullptr, * dout = nullptr;
     int iq = -1, ik = -1, iv = -1, im = -1, iout = -1;
-    int h_q = 16, h_kv = 8, d = 128, t = 512;
+    int h_q = 16, h_kv = 8, d = 128, t = 32;
     std::vector<float> q_buf, k_buf, v_buf, m_buf, out_buf; // host staging
 };
 static axcl_attn_engine g_attn;
@@ -430,7 +430,7 @@ static axcl_fused_engine g_gate_up; // gate + up projections
 static void axcl_attn_load() {
     if (g_attn.model != 0) return;
     const char * env = getenv("AXCL_ATTN_MODEL");
-    const char * path = env ? env : "/usr/local/share/ggml-axcl/attn_h16_d128_t512.axmodel";
+    const char * path = env ? env : "/usr/local/share/ggml-axcl/attn_h16_d128_t32.axmodel";
     FILE * f = fopen(path, "r");
     if (!f) return;
     fclose(f);
