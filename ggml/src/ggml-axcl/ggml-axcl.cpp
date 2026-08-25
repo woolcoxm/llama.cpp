@@ -853,6 +853,21 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
     }
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
+    // one-line rejection telemetry per unique (k,n,m) triple
+    {
+        static std::mutex m;
+        static std::unordered_map<uint64_t, bool> seen;
+        uint64_t key = ((uint64_t) src0->ne[0] << 44) ^ ((uint64_t) src0->ne[1] << 12) ^ src1->ne[1];
+        std::lock_guard<std::mutex> l(m);
+        if (!seen.count(key)) {
+            seen[key] = true;
+            bool engine = axcl_matmul_get(src0->ne[0], src0->ne[1]) != nullptr;
+            fprintf(stderr, "[axcl-sched] MUL_MAT k=%lld n=%lld m=%lld type=%s engine=%d -> %s\n",
+                    (long long) src0->ne[0], (long long) src0->ne[1], (long long) src1->ne[1],
+                    ggml_type_name(src0->type), (int) engine,
+                    (engine && src1->ne[1] == 1) ? "ACCEPT" : "REJECT");
+        }
+    }
     if (src0 == nullptr || src1 == nullptr) {
         return false;
     }
