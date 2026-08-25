@@ -25,6 +25,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <sys/types.h>
 #include <unordered_set>
 #include <chrono>
@@ -685,11 +686,18 @@ static bool axcl_engine_global_init() {
     return available;
 }
 
-static std::string axcl_matmul_model_path(int64_t k, int64_t n) {
+static std::string axcl_matmul_model_path(int64_t m, int64_t k, int64_t n) {
     const char * dir = getenv("AXCL_MATMUL_DIR");
-    char         path[512];
-    snprintf(path, sizeof(path), "%s/matmul_m1_k%lld_n%lld.axmodel",
-             dir ? dir : "/usr/local/share/ggml-axcl/matmul", (long long) k, (long long) n);
+    char path[512];
+    if (m > 1) {
+        // batch engines live in their own directory
+        snprintf(path, sizeof(path), "/usr/local/share/ggml-axcl/matmul_m%lld/matmul_m%lld_k%lld_n%lld.axmodel",
+                 (long long) m, (long long) m, (long long) k, (long long) n);
+        if (access(path, R_OK) == 0) return path;
+        return ""; // no batch engine — caller falls back
+    }
+    snprintf(path, sizeof(path), "%s/matmul_m%lld_k%lld_n%lld.axmodel",
+             dir ? dir : "/usr/local/share/ggml-axcl/matmul", (long long) m, (long long) k, (long long) n);
     return path;
 }
 
@@ -800,18 +808,19 @@ static bool axcl_chain_run(axcl_fused_engine * fe, struct ggml_tensor * node,
     return true;
 }
 
-static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
+static axcl_matmul * axcl_matmul_load(int64_t m, int64_t k, int64_t n) {
     if (!axcl_engine_global_init()) {
         return nullptr;
     }
     std::lock_guard<std::mutex> exec_lock(axcl_exec_mutex);
 
     axcl_matmul * mm = new axcl_matmul();
-    mm->m = 1;
+    mm->m = m;
     mm->k = k;
     mm->n = n;
 
-    std::string path = axcl_matmul_model_path(k, n);
+    std::string path = axcl_matmul_model_path(m, k, n);
+    if (path.empty()) { delete mm; return nullptr; }
     fprintf(stderr, "[axcl-dbg] loading %s\n", path.c_str());
     if (axclrtEngineLoadFromFile(path.c_str(), &mm->model_id) != AXCL_SUCC) {
         GGML_LOG_WARN("ggml-axcl: no matmul engine at %s\n", path.c_str());
@@ -858,15 +867,15 @@ static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
     mm->y_idx = axclrtEngineGetOutputIndexByName(mm->io_info, mm->y_name.c_str());
 
     mm->w_h.resize(k * n);
-    if (axclrtMallocHost((void **) &mm->x_h, (size_t) k * 4) != AXCL_SUCC ||
-        axclrtMallocHost((void **) &mm->y_h, (size_t) n * 4) != AXCL_SUCC) {
+    if (axclrtMallocHost((void **) &mm->x_h, (size_t) m * k * 4) != AXCL_SUCC ||
+        axclrtMallocHost((void **) &mm->y_h, (size_t) m * n * 4) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: pinned host alloc failed for %s\n", path.c_str());
         delete mm;
         return nullptr;
     }
-    if (axclrtMalloc(&mm->dx, (size_t) k * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+    if (axclrtMalloc(&mm->dx, (size_t) m * k * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
         axclrtMalloc(&mm->dw, (size_t) k * n * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
-        axclrtMalloc(&mm->dy, (size_t) n * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC) {
+        axclrtMalloc(&mm->dy, (size_t) m * n * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: CMM alloc failed for %s\n", path.c_str());
         delete mm;
         return nullptr;
@@ -883,9 +892,13 @@ static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
 // shape-keyed engine cache; after preload it is final (no IO on hot paths)
 struct axcl_matmul_cache_t {
     std::mutex mutex;
-    std::unordered_map<uint64_t, axcl_matmul *> engines; // key: (k << 32) | n
+    // key: (m << 44) | (k << 22) | n  (m small: 1,4,8; k,n < 4M)
+    std::unordered_map<uint64_t, axcl_matmul *> engines;
     std::unordered_map<uint64_t, bool>        missing;
     bool                                       preloaded = false;
+    static uint64_t make_key(int64_t m, int64_t k, int64_t n) {
+        return ((uint64_t) m << 44) | ((uint64_t) k << 22) | (uint32_t) n;
+    }
 };
 
 static axcl_matmul_cache_t * axcl_matmul_cache() {
@@ -893,20 +906,21 @@ static axcl_matmul_cache_t * axcl_matmul_cache() {
     return &cache;
 }
 
-static axcl_matmul * axcl_matmul_get(int64_t k, int64_t n) {
+static axcl_matmul * axcl_matmul_get(int64_t m, int64_t k, int64_t n) {
     axcl_matmul_cache_t * cache = axcl_matmul_cache();
 
-    const uint64_t key = ((uint64_t) k << 32) | (uint32_t) n;
+    const uint64_t key = axcl_matmul_cache_t::make_key(m, k, n);
 
     std::lock_guard<std::mutex> lock(cache->mutex);
     auto it = cache->engines.find(key);
     if (it != cache->engines.end()) {
         return it->second;
     }
-    if (cache->missing.count(key) || cache->preloaded) {
-        return nullptr; // after preload the cache is final: no IO on hot paths
+    if (cache->missing.count(key) || (cache->preloaded && m == 1)) {
+        return nullptr; // after preload the m=1 set is final; batch engines
+                        // load lazily (first prefill/speculative batch)
     }
-    axcl_matmul * mm = axcl_matmul_load(k, n);
+    axcl_matmul * mm = axcl_matmul_load(m, k, n);
     if (mm) {
         cache->engines[key] = mm;
     } else {
@@ -933,16 +947,35 @@ static void axcl_preload_all_engines() {
     if (!dp) {
         return;
     }
+    // batch engines (m>1) preload from their own directories
+    for (int64_t bm : {4}) {
+        char bdir[512];
+        snprintf(bdir, sizeof(bdir), "/usr/local/share/ggml-axcl/matmul_m%lld", (long long) bm);
+        DIR * bdp = opendir(bdir);
+        if (!bdp) continue;
+        struct dirent * bde;
+        while ((bde = readdir(bdp)) != nullptr) {
+            int64_t m, k, n;
+            if (sscanf(bde->d_name, "matmul_m%lld_k%lld_n%lld.axmodel", (long long *) &m, (long long *) &k, (long long *) &n) == 3) {
+                const uint64_t key = axcl_matmul_cache_t::make_key(m, k, n);
+                if (!cache->engines.count(key) && !cache->missing.count(key)) {
+                    axcl_matmul * mm = axcl_matmul_load(m, k, n);
+                    if (mm) cache->engines[key] = mm; else cache->missing[key] = true;
+                }
+            }
+        }
+        closedir(bdp);
+    }
     struct dirent * de;
     int loaded = 0;
     while ((de = readdir(dp)) != nullptr) {
-        int64_t k, n;
-        if (sscanf(de->d_name, "matmul_m1_k%lld_n%lld.axmodel", (long long *) &k, (long long *) &n) == 2) {
-            const uint64_t key = ((uint64_t) k << 32) | (uint32_t) n;
+        int64_t m, k, n;
+        if (sscanf(de->d_name, "matmul_m%lld_k%lld_n%lld.axmodel", (long long *) &m, (long long *) &k, (long long *) &n) == 3) {
+            const uint64_t key = axcl_matmul_cache_t::make_key(m, k, n);
             if (cache->engines.count(key) || cache->missing.count(key)) {
                 continue;
             }
-            axcl_matmul * mm = axcl_matmul_load(k, n);
+            axcl_matmul * mm = axcl_matmul_load(m, k, n);
             if (mm) {
                 cache->engines[key] = mm;
                 loaded++;
@@ -996,11 +1029,15 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
     g_chain_x_override = nullptr;
     if (dev_x_override != nullptr) {
         // device-resident X: bind directly below, no staging
-    } else if (src1->nb[0] == 4) {
-        memcpy(mm->x_h, src1->data, (size_t) k * 4);
+    } else if (src1->nb[0] == 4 && src1->nb[1] == (size_t) k * 4) {
+        memcpy(mm->x_h, src1->data, (size_t) mm->m * k * 4);
     } else {
-        for (int64_t kk = 0; kk < k; kk++)
-            mm->x_h[kk] = *(const float *) ((const char *) src1->data + (size_t) kk * src1->nb[0]);
+        // strided X: copy row by row
+        for (int64_t row = 0; row < mm->m; row++) {
+            const char * xr = (const char *) src1->data + (size_t) row * src1->nb[1];
+            for (int64_t kk = 0; kk < k; kk++)
+                mm->x_h[row * k + kk] = *(const float *) (xr + (size_t) kk * src1->nb[0]);
+        }
     }
 
     // W: card-resident when staged, else one-time staging into the pool
@@ -1027,7 +1064,7 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
 
     auto t2 = std::chrono::steady_clock::now();
     if (dev_x_override == nullptr &&
-        axclrtMemcpy(mm->dx, mm->x_h, (size_t) k * 4, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC) {
+        axclrtMemcpy(mm->dx, mm->x_h, (size_t) mm->m * k * 4, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: X H2D failed\n");
         return false;
     }
@@ -1059,7 +1096,7 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
             return false;
         }
     }
-    if (axclrtEngineSetInputBufferByIndex(io, mm->x_idx, xbuf, (size_t) k * 4) != AXCL_SUCC) {
+    if (axclrtEngineSetInputBufferByIndex(io, mm->x_idx, xbuf, (size_t) mm->m * k * 4) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: bind device buffers failed\n");
         return false;
     }
@@ -1081,11 +1118,19 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
         return false;
     }
 
-    if (axclrtMemcpy(mm->y_h, mm->dy, (size_t) n * 4, AXCL_MEMCPY_DEVICE_TO_HOST) != AXCL_SUCC) {
+    if (axclrtMemcpy(mm->y_h, mm->dy, (size_t) mm->m * n * 4, AXCL_MEMCPY_DEVICE_TO_HOST) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: D2H copy failed\n");
         return false;
     }
-    memcpy(dst->data, mm->y_h, (size_t) n * 4);
+    if (dst->nb[0] == 4 && dst->nb[1] == (size_t) n * 4) {
+        memcpy(dst->data, mm->y_h, (size_t) mm->m * n * 4);
+    } else {
+        for (int64_t row = 0; row < mm->m; row++) {
+            float * dr = (float *) ((char *) dst->data + (size_t) row * dst->nb[1]);
+            for (int64_t nn = 0; nn < n; nn++)
+                dr[nn] = mm->y_h[row * n + nn];
+        }
+    }
     auto t6 = std::chrono::steady_clock::now();
 
     auto us = [](auto a, auto b) { return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count(); };
@@ -2006,7 +2051,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                         (e / (src1->ne[0]*src1->ne[1]*src1->ne[2])) * src1->nb[3]);
                 // (approximate: assumes dim0/1 contiguous pairing good enough for a fingerprint)
             }
-            axcl_matmul *        mm   = src1->ne[1] == 1 ? axcl_matmul_get(src0->ne[0], src0->ne[1]) : nullptr;
+            axcl_matmul *        mm   = axcl_matmul_get(src1->ne[1], src0->ne[0], src0->ne[1]);
             if (src0->ne[1] == 151936 && getenv("GGML_AXCL_CNT")) {
                 fprintf(stderr, "[cnt] qkvn=%d addnorm=%d gludown=%d norm=%d add=%d glu=%d\n",
                         g_dbg_qkvn, g_dbg_addnorm, g_dbg_gludown, g_dbg_norm, g_dbg_add, g_dbg_glu);
