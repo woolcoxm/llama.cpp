@@ -82,6 +82,18 @@ static int32_t axcl_get_device_count() {
     return (int32_t) count;
 }
 
+// the card's slot index is NOT 0 on switch-topology HATs (observed: 3).
+// axclrtGetDeviceList() is also the mandatory activation probe: without it
+// the device manager reports every device as "not connected"
+static int32_t axcl_get_device_index(int32_t ordinal) {
+    axclrtDeviceList dl;
+    memset(&dl, 0, sizeof(dl));
+    if (axclrtGetDeviceList(&dl) != AXCL_SUCC || dl.num == 0) {
+        return 0;
+    }
+    return dl.devices[ordinal < (int32_t) dl.num ? ordinal : 0];
+}
+
 static std::string axcl_get_device_description(int32_t device) {
     axclrtDeviceProperties props;
     memset(&props, 0, sizeof(props));
@@ -282,12 +294,20 @@ static bool axcl_engine_global_init() {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     if (!initialized) {
-        // engine ops may run before any backend init (supports_op probes)
-        axclrtSetDevice(0);
-        axclError err = axclrtEngineInit(AXCL_VNPU_DISABLE);
-        available     = (err == AXCL_SUCC);
+        // activation sequence discovered the hard way: GetDeviceList probes
+        // and activates the device (also yields the real slot index);
+        // CreateContext/SetCurrentContext must precede EngineInit
+        int32_t dev = axcl_get_device_index(0);
+        axclrtSetDevice(dev);
+        axclrtContext ctx = 0;
+        axclError  err  = axclrtCreateContext(&ctx, dev);
+        if (err == AXCL_SUCC) {
+            axclrtSetCurrentContext(ctx);
+            err = axclrtEngineInit(AXCL_VNPU_DISABLE);
+        }
+        available = (err == AXCL_SUCC);
         if (!available) {
-            GGML_LOG_ERROR("ggml-axcl: axclrtEngineInit failed with %d\n", (int) err);
+            GGML_LOG_ERROR("ggml-axcl: engine activation failed with %d\n", (int) err);
         }
         initialized = true;
     }
@@ -534,8 +554,10 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
         GGML_LOG_ERROR("ggml-axcl: invalid device %d\n", device);
         return nullptr;
     }
-    if (axclrtSetDevice(device) != AXCL_SUCC) {
-        GGML_LOG_ERROR("ggml-axcl: axclrtSetDevice(%d) failed\n", device);
+    // translate ordinal to the real slot index via the activation probe
+    int32_t slot = axcl_get_device_index(device);
+    if (axclrtSetDevice(slot) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: axclrtSetDevice(%d) failed\n", slot);
         return nullptr;
     }
 
@@ -578,7 +600,7 @@ static void ggml_backend_axcl_device_get_memory(ggml_backend_dev_t dev, size_t *
     ggml_backend_axcl_device_context * ctx = (ggml_backend_axcl_device_context *) dev->context;
     axclrtDeviceProperties props;
     memset(&props, 0, sizeof(props));
-    if (axclrtGetDeviceProperties(ctx->device, &props) == AXCL_SUCC) {
+    if (axclrtGetDeviceProperties(axcl_get_device_index(ctx->device), &props) == AXCL_SUCC) {
         *total = (size_t) props.totalCmmSize * 1024;
         *free  = (size_t) props.freeCmmSize * 1024;
     } else {
@@ -601,7 +623,7 @@ static void ggml_backend_axcl_device_get_props(ggml_backend_dev_t dev, struct gg
     ggml_backend_axcl_device_context * ctx = (ggml_backend_axcl_device_context *) dev->context;
     axclrtDeviceProperties             axcl_props;
     memset(&axcl_props, 0, sizeof(axcl_props));
-    if (axclrtGetDeviceProperties(ctx->device, &axcl_props) == AXCL_SUCC) {
+    if (axclrtGetDeviceProperties(axcl_get_device_index(ctx->device), &axcl_props) == AXCL_SUCC) {
         props->device_id = ctx->device_id.c_str();
     }
 
@@ -741,7 +763,7 @@ ggml_backend_reg_t ggml_backend_axcl_reg(void) {
 
                 axclrtDeviceProperties props;
                 memset(&props, 0, sizeof(props));
-                if (axclrtGetDeviceProperties(i, &props) == AXCL_SUCC) {
+                if (axclrtGetDeviceProperties(axcl_get_device_index(i), &props) == AXCL_SUCC) {
                     char buf[32];
                     snprintf(buf, sizeof(buf), "%04x:%02x:%02x.0", props.pciDomain, props.pciBusID,
                              props.pciDeviceID);
