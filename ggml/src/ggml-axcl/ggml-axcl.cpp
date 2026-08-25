@@ -569,6 +569,10 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
+        if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW ||
+            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+            continue; // metadata-only: data pointer already correct
+        }
         if (node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor * src0 = node->src[0];
             axcl_matmul *        mm   = axcl_matmul_get(src0->ne[0], src0->ne[1]);
@@ -720,6 +724,17 @@ static ggml_backend_buffer_t ggml_backend_axcl_device_buffer_from_host_ptr(ggml_
 
 static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
+    // view-class ops are metadata-only (no data movement): the scheduler
+    // places them in our splits, so accept and skip them at compute time
+    switch (op->op) {
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            break;
+    }
     if (op->op != GGML_OP_MUL_MAT) {
         return false;
     }
