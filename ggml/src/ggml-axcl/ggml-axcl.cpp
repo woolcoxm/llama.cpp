@@ -110,13 +110,13 @@ static std::string axcl_get_device_description(int32_t device) {
 
 struct ggml_backend_axcl_buffer_context {
     int32_t device;
-    void *  ptr;
-    size_t  size;
-};
+    void *  ptr;   // plain host memory: CMM pointers are NOT cpu-dereferenceable,
+    size_t  size;  // so ggml-visible buffers stay in host RAM; the matmul
+};                  // engines stage through CMM internally via axclrtMemcpy
 
 static void ggml_backend_axcl_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_axcl_buffer_context * ctx = (ggml_backend_axcl_buffer_context *) buffer->context;
-    axclrtFree(ctx->ptr);
+    free(ctx->ptr);
     delete ctx;
 }
 
@@ -128,28 +128,19 @@ static void * ggml_backend_axcl_buffer_get_base(ggml_backend_buffer_t buffer) {
 static void ggml_backend_axcl_buffer_memset_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                    uint8_t value, size_t offset, size_t size) {
     GGML_UNUSED(buffer);
-    void * dst = (char *) tensor->data + offset;
-    if (axclrtMemset(dst, value, size) != AXCL_SUCC) {
-        GGML_LOG_ERROR("ggml-axcl: memset failed\n");
-    }
+    memset((char *) tensor->data + offset, value, size);
 }
 
 static void ggml_backend_axcl_buffer_set_tensor(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
                                                 const void * data, size_t offset, size_t size) {
     GGML_UNUSED(buffer);
-    void * dst = (char *) tensor->data + offset;
-    if (axclrtMemcpy(dst, data, size, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC) {
-        GGML_LOG_ERROR("ggml-axcl: H2D memcpy failed (%zu bytes)\n", size);
-    }
+    memcpy((char *) tensor->data + offset, data, size);
 }
 
 static void ggml_backend_axcl_buffer_get_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor,
                                                 void * data, size_t offset, size_t size) {
     GGML_UNUSED(buffer);
-    const void * src = (const char *) tensor->data + offset;
-    if (axclrtMemcpy(data, src, size, AXCL_MEMCPY_DEVICE_TO_HOST) != AXCL_SUCC) {
-        GGML_LOG_ERROR("ggml-axcl: D2H memcpy failed (%zu bytes)\n", size);
-    }
+    memcpy(data, (const char *) tensor->data + offset, size);
 }
 
 static bool ggml_backend_axcl_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const struct ggml_tensor * src,
@@ -163,9 +154,7 @@ static bool ggml_backend_axcl_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 
 static void ggml_backend_axcl_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_axcl_buffer_context * ctx = (ggml_backend_axcl_buffer_context *) buffer->context;
-    if (axclrtMemset(ctx->ptr, value, ctx->size) != AXCL_SUCC) {
-        GGML_LOG_ERROR("ggml-axcl: clear failed\n");
-    }
+    memset(ctx->ptr, value, ctx->size);
 }
 
 static const struct ggml_backend_buffer_i ggml_backend_axcl_buffer_interface = {
@@ -195,10 +184,9 @@ static ggml_backend_buffer_t ggml_backend_axcl_buffer_type_alloc_buffer(ggml_bac
                                                                         size_t size) {
     size = axcl_aligned_size(size, axcl_alloc_alignment());
 
-    void * ptr = nullptr;
-    if (axclrtMalloc(&ptr, size, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC || ptr == nullptr) {
-        GGML_LOG_ERROR("ggml-axcl: axclrtMalloc failed for %zu bytes\n", size);
-        // null buffer: the caller will fall back to another device
+    void * ptr = malloc(size);
+    if (ptr == nullptr) {
+        GGML_LOG_ERROR("ggml-axcl: host alloc failed for %zu bytes\n", size);
         return ggml_backend_buffer_init(buft, ggml_backend_axcl_buffer_interface, nullptr, 0);
     }
 
@@ -338,6 +326,7 @@ static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
     mm->n = n;
 
     std::string path = axcl_matmul_model_path(k, n);
+    fprintf(stderr, "[axcl-dbg] loading %s\n", path.c_str());
     if (axclrtEngineLoadFromFile(path.c_str(), &mm->model_id) != AXCL_SUCC) {
         GGML_LOG_WARN("ggml-axcl: no matmul engine at %s\n", path.c_str());
         delete mm;
@@ -377,6 +366,7 @@ static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
             }
         }
     }
+    fprintf(stderr, "[axcl-dbg] io names ok\n");
     mm->x_idx = axclrtEngineGetInputIndexByName(mm->io_info, mm->x_name.c_str());
     mm->w_idx = axclrtEngineGetInputIndexByName(mm->io_info, mm->w_name.c_str());
     mm->y_idx = axclrtEngineGetOutputIndexByName(mm->io_info, mm->y_name.c_str());
@@ -392,6 +382,7 @@ static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
         return nullptr;
     }
 
+    fprintf(stderr, "[axcl-dbg] engine ready\n");
     GGML_LOG_INFO("ggml-axcl: matmul engine loaded %s (inputs '%s','%s' -> '%s', idx %d,%d -> %d)\n",
                   path.c_str(), mm->x_name.c_str(), mm->w_name.c_str(), mm->y_name.c_str(), mm->x_idx,
                   mm->w_idx, mm->y_idx);
@@ -456,6 +447,7 @@ static void axcl_dequant_any_to_f32_transposed(const struct ggml_tensor * t, flo
 static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor * src0,
                                       const struct ggml_tensor * src1, struct ggml_tensor * dst) {
     std::lock_guard<std::mutex> exec_lock(axcl_exec_mutex);
+    fprintf(stderr, "[axcl-dbg] compute k=%lld n=%lld\n", (long long) mm->k, (long long) mm->n);
     const int64_t k = mm->k;
     const int64_t n = mm->n;
 
