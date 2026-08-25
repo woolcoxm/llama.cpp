@@ -78,6 +78,10 @@
 #include "ggml-cann.h"
 #endif
 
+#ifdef GGML_USE_AXCL
+#include "ggml-axcl.h"
+#endif
+
 #ifdef GGML_USE_ZENDNN
 #include "ggml-zendnn.h"
 #endif
@@ -155,6 +159,10 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_CANN
         register_backend(ggml_backend_cann_reg());
+#endif
+
+#ifdef GGML_USE_AXCL
+        register_backend(ggml_backend_axcl_reg());
 #endif
 #ifdef GGML_USE_BLAS
         register_backend(ggml_backend_blas_reg());
