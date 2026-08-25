@@ -327,6 +327,7 @@ static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
     if (!axcl_engine_global_init()) {
         return nullptr;
     }
+    std::lock_guard<std::mutex> exec_lock(axcl_exec_mutex);
 
     axcl_matmul * mm = new axcl_matmul();
     mm->m = 1;
@@ -449,8 +450,12 @@ static void axcl_dequant_any_to_f32_transposed(const struct ggml_tensor * t, flo
     }
 }
 
+// the AXCL engine IO is not thread-safe: serialize loads and executes
+static std::mutex axcl_exec_mutex;
+
 static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor * src0,
                                       const struct ggml_tensor * src1, struct ggml_tensor * dst) {
+    std::lock_guard<std::mutex> exec_lock(axcl_exec_mutex);
     const int64_t k = mm->k;
     const int64_t n = mm->n;
 
