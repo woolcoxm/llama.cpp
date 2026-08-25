@@ -1545,10 +1545,13 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_CPY:
         case GGML_OP_DUP:
             return op->type == GGML_TYPE_F32;
-        case GGML_OP_GET_ROWS:
         case GGML_OP_ROPE:
         case GGML_OP_SET_ROWS:
         case GGML_OP_DIAG_MASK_INF:
+            // only during generation (batch-1): the multi-token prompt
+            // path has different tensor layouts that crash our host ops
+            return op->src[0] != nullptr && op->src[0]->ne[1] <= 2;
+        case GGML_OP_GET_ROWS:
             return true;
         default:
             break;
