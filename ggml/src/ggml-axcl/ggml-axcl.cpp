@@ -995,6 +995,10 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
     // view-class ops are metadata-only (no data movement): the scheduler
     // places them in our splits, so accept and skip them at compute time
     switch (op->op) {
+        case GGML_OP_NONE:
+            // weight leaves in our buffer are readable (we dequant them):
+            // the scheduler probes op=NONE on tensors during coloring
+            return true;
         case GGML_OP_RESHAPE:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
