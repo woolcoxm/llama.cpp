@@ -502,17 +502,22 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
     const int64_t n = mm->n;
 
     // X: activation, src1 is [K, 1] f32 contiguous
+    fprintf(stderr, "[axcl-dbg]  stg1 x\n");
     memcpy(mm->x_h.data(), src1->data, (size_t) k * 4);
+    fprintf(stderr, "[axcl-dbg]  stg2 dequant\n");
 
-    // W: dequant + transpose into [K, N]
     axcl_dequant_any_to_f32_transposed(src0, mm->w_h.data());
+    fprintf(stderr, "[axcl-dbg]  stg3 h2d\n");
 
-    if (axclrtMemcpy(mm->dx, mm->x_h.data(), (size_t) k * 4, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC ||
-        axclrtMemcpy(mm->dw, mm->w_h.data(), (size_t) k * n * 4, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC) {
+    axclError e1 = axclrtMemcpy(mm->dx, mm->x_h.data(), (size_t) k * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+    axclError e2 = axclrtMemcpy(mm->dw, mm->w_h.data(), (size_t) k * n * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+    fprintf(stderr, "[axcl-dbg]  stg4 bind\n");
+    if (e1 != AXCL_SUCC || e2 != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: H2D copy failed\n");
         return false;
     }
 
+    fprintf(stderr, "[axcl-dbg]  stg5 execute\n");
     if (axclrtEngineSetInputBufferByIndex(mm->io, mm->x_idx, mm->dx, (size_t) k * 4) != AXCL_SUCC ||
         axclrtEngineSetInputBufferByIndex(mm->io, mm->w_idx, mm->dw, (size_t) k * n * 4) != AXCL_SUCC ||
         axclrtEngineSetOutputBufferByIndex(mm->io, mm->y_idx, mm->dy, (size_t) n * 4) != AXCL_SUCC) {
@@ -520,7 +525,9 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
         return false;
     }
 
-    if (axclrtEngineExecute(mm->model_id, mm->context_id, 0, mm->io) != AXCL_SUCC) {
+    axclError ex = axclrtEngineExecute(mm->model_id, mm->context_id, 0, mm->io);
+    fprintf(stderr, "[axcl-dbg]  stg6 d2h\n");
+    if (ex != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: engine execute failed\n");
         return false;
     }
@@ -575,11 +582,12 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 return GGML_STATUS_ABORTED;
             }
         } else {
+            fprintf(stderr, "[axcl-dbg] node %d op %s NOT SUPPORTED\n", i, ggml_op_name(node->op));
             GGML_LOG_ERROR("ggml-axcl: node %d op %s not supported\n", i, ggml_op_name(node->op));
             return GGML_STATUS_ABORTED;
         }
     }
-
+    fprintf(stderr, "[axcl-dbg] graph done: %d nodes ok\n", cgraph->n_nodes);
     return GGML_STATUS_SUCCESS;
 }
 
