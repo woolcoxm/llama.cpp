@@ -438,7 +438,7 @@ static void axcl_dequant_any_to_f32_transposed(const struct ggml_tensor * t, flo
         }
         return;
     }
-    const ggml_type_traits_t * traits = ggml_get_type_traits(t->type);
+    const struct ggml_type_traits * traits = ggml_get_type_traits(t->type);
     GGML_ASSERT(traits && traits->to_float);
     std::vector<float> row(k);
     for (int64_t nn = 0; nn < n; nn++) {
