@@ -186,17 +186,20 @@ static ggml_backend_buffer_t ggml_backend_axcl_buffer_type_alloc_buffer(ggml_bac
                                                                         size_t size) {
     size = axcl_aligned_size(size, axcl_alloc_alignment());
 
-    fprintf(stderr, "[axcl-buf] alloc_buffer(%zu MB)\n", size / 1024 / 1024);
-    void * ptr = malloc(size);
+    // fusion routes small norm/gate weights into our buffer beyond llama.cpp's
+    // size estimate; add slack so the ctx allocator never runs dry
+    const size_t slack = 64ull * 1024 * 1024;
+    fprintf(stderr, "[axcl-buf] alloc_buffer(%zu MB + %zu slack)\n", size / 1024 / 1024, slack / 1024 / 1024);
+    void * ptr = malloc(size + slack);
     if (ptr == nullptr) {
-        fprintf(stderr, "[axcl-buf] HOST ALLOC FAILED for %zu bytes\n", size);
-        GGML_LOG_ERROR("ggml-axcl: host alloc failed for %zu bytes\n", size);
+        fprintf(stderr, "[axcl-buf] HOST ALLOC FAILED for %zu bytes\n", size + slack);
+        GGML_LOG_ERROR("ggml-axcl: host alloc failed for %zu bytes\n", size + slack);
         return ggml_backend_buffer_init(buft, ggml_backend_axcl_buffer_interface, nullptr, 0);
     }
 
-    auto * ctx = new ggml_backend_axcl_buffer_context{0, ptr, size};
+    auto * ctx = new ggml_backend_axcl_buffer_context{0, ptr, size + slack};
 
-    return ggml_backend_buffer_init(buft, ggml_backend_axcl_buffer_interface, ctx, size);
+    return ggml_backend_buffer_init(buft, ggml_backend_axcl_buffer_interface, ctx, size + slack);
 }
 
 static size_t ggml_backend_axcl_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
