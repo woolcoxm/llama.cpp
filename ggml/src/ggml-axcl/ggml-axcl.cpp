@@ -914,10 +914,13 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             const bool mul = (node->op == GGML_OP_MUL);
             // scalar broadcast or same-shape (the only shapes in our splits)
             const int64_t ne = ggml_nbytes(node) / 4; // f32 contiguous fast path
+            // flat fast path only when BOTH tensors have the same total size
+            // (broadcast [128,1,1] × [128,16,9] would overread src1)
             const bool same = src0->nb[0] == 4 && src1->nb[0] == 4 &&
-                              (src1->ne[0] * ((src1->ne[1] > 1 ? src1->ne[1] : 1)) == 1 || ne0 == src1->ne[0]);
+                              ggml_nbytes(src1) >= ggml_nbytes(node) &&
+                              src0->ne[0] == src1->ne[0];
             if (same && src0->nb[1] == (size_t) ne0 * 4 && node->nb[1] == (size_t) ne0 * 4 &&
-                (src1->ne[0] * src1->ne[1] == 1 || src1->nb[1] == (size_t) src1->ne[0] * 4)) {
+                (src1->ne[1] == node->ne[1] || src1->ne[0] * src1->ne[1] == 1)) {
                 const float * a = (const float *) src0->data;
                 const float * b = (const float *) src1->data;
                 const bool scalar = (src1->ne[0] * src1->ne[1] == 1);
@@ -1287,8 +1290,14 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (done.count(i)) continue; // already computed by a fused engine
+        if (done.count(i)) continue;
         struct ggml_tensor * node = cgraph->nodes[i];
+        static int trace_n = 0;
+        if (trace_n < 60) {
+            fprintf(stderr, "[T] %s ne=(%lld,%lld,%lld)\n", ggml_op_name(node->op),
+                    (long long)node->ne[0], (long long)node->ne[1], (long long)node->ne[2]);
+            trace_n++;
+        }
 
         if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_VIEW ||
             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
