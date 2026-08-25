@@ -438,6 +438,7 @@ static void axcl_attn_load() {
         g_attn.model = 0;
         return;
     }
+    fprintf(stderr, "ATTN_ENGINE_LOADED model=%llx t=%d\n", (unsigned long long)g_attn.model, g_attn.t);
     axclrtEngineGetIOInfo(g_attn.model, &g_attn.info);
     axclrtEngineCreateIO(g_attn.info, &g_attn.io);
     axclrtEngineCreateContext(g_attn.model, &g_attn.ectx);
@@ -1313,8 +1314,7 @@ static void axcl_qkv_try_flush() {
                 axclrtMemcpy(xqkv_q[0]->data, g_qkv.dev_out[0], 2048*4, AXCL_MEMCPY_DEVICE_TO_HOST);
                 axclrtMemcpy(xqkv_q[1]->data, g_qkv.dev_out[1], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
                 axclrtMemcpy(xqkv_q[2]->data, g_qkv.dev_out[2], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
-                fprintf(stderr, "[axcl-fuse] QKV: 3 projections -> 1 engine call\n");
-            }
+                            }
         }
     }
     xqkv_count = 0; xqkv_src1 = nullptr;
