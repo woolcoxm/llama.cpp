@@ -303,9 +303,6 @@ static bool axcl_engine_global_init() {
         }
         initialized = true;
     }
-    if (available) {
-        axcl_preload_all_engines();
-    }
     return available;
 }
 
@@ -609,6 +606,9 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
     if (device < 0 || device >= axcl_get_device_count()) {
         GGML_LOG_ERROR("ggml-axcl: invalid device %d\n", device);
         return nullptr;
+    }
+    if (axcl_engine_global_init()) {
+        axcl_preload_all_engines(); // outside the activation mutex
     }
     // translate ordinal to the real slot index via the activation probe
     int32_t slot = axcl_get_device_index(device);
