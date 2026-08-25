@@ -226,12 +226,18 @@ static size_t ggml_backend_axcl_buffer_type_get_max_size(ggml_backend_buffer_typ
     return AXCL_MAX_BUFFER_SIZE;
 }
 
+static bool ggml_backend_axcl_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return true; // host RAM: CPU and our backend both access tensors directly
+}
+
 static const struct ggml_backend_buffer_type_i axcl_buffer_type_interface = {
     /* .get_name       = */ ggml_backend_axcl_buffer_type_name,
     /* .alloc_buffer   = */ ggml_backend_axcl_buffer_type_alloc_buffer,
     /* .get_alignment  = */ ggml_backend_axcl_buffer_type_get_alignment,
     /* .get_max_size   = */ ggml_backend_axcl_buffer_type_get_max_size,
     /* .get_alloc_size = */ NULL,
+    /* .is_host        = */ ggml_backend_axcl_buffer_type_is_host,
 };
 
 ggml_backend_buffer_type_t ggml_backend_axcl_buffer_type(int32_t device) {
@@ -315,10 +321,17 @@ static uint64_t prof_stage_wstage = 0, prof_stage_xh2d = 0, prof_stage_bind = 0,
                 prof_stage_exec = 0, prof_stage_yd2h = 0, prof_stage_total = 0,
                 prof_wstaged = 0, prof_count = 0;
 #define PROF_REPORT_EVERY 120
+static uint64_t prof_t_attn = 0, prof_t_qkv = 0, prof_t_gateup = 0, prof_t_host = 0, prof_t_small = 0;
+static uint64_t prof_n_attn = 0, prof_n_qkv = 0, prof_n_gateup = 0, prof_n_host = 0, prof_n_small = 0;
+static inline uint64_t axcl_us() {
+    return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 static void prof_report() {
     if (prof_count % PROF_REPORT_EVERY != 0 || prof_count == 0) return;
     fprintf(stderr,
-        "[axcl-prof] computes=%llu wstaged=%llu | avg micros/compute: total=%llu wstage=%llu xh2d=%llu bind=%llu exec=%llu yd2h=%llu other=%llu\n",
+        "[axcl-prof] computes=%llu wstaged=%llu | avg micros/compute: total=%llu wstage=%llu xh2d=%llu bind=%llu exec=%llu yd2h=%llu other=%llu | attn=%llu/%llu qkv=%llu/%llu gateup=%llu/%llu host=%llu/%llu small=%llu/%llu\n",
         (unsigned long long) prof_count, (unsigned long long) prof_wstaged,
         (unsigned long long) (prof_stage_total / prof_count),
         (unsigned long long) (prof_stage_wstage / prof_count),
@@ -327,7 +340,12 @@ static void prof_report() {
         (unsigned long long) (prof_stage_exec / prof_count),
         (unsigned long long) (prof_stage_yd2h / prof_count),
         (unsigned long long) ((prof_stage_total - prof_stage_wstage - prof_stage_xh2d -
-                               prof_stage_bind - prof_stage_exec - prof_stage_yd2h) / prof_count));
+                               prof_stage_bind - prof_stage_exec - prof_stage_yd2h) / prof_count),
+        (unsigned long long) prof_t_attn, (unsigned long long) prof_n_attn,
+        (unsigned long long) prof_t_qkv, (unsigned long long) prof_n_qkv,
+        (unsigned long long) prof_t_gateup, (unsigned long long) prof_n_gateup,
+        (unsigned long long) prof_t_host, (unsigned long long) prof_n_host,
+        (unsigned long long) prof_t_small, (unsigned long long) prof_n_small);
     fflush(stderr);
 }
 
@@ -672,11 +690,12 @@ static void * g_chain_x_override = nullptr;
 // valid only in topological order (engine output buffers get reused); the
 // map is cleared whenever a new forward pass starts (GET_ROWS node).
 struct axcl_chain {
-    axcl_fused_engine norm, add, glu;
+    axcl_fused_engine norm, add, glu, qkvn, addnorm, gludown;
     bool engines_ok = false;
     std::unordered_map<const void *, void *> dev;
 };
 static axcl_chain g_chain;
+static int g_dbg_qkvn, g_dbg_addnorm, g_dbg_gludown, g_dbg_norm, g_dbg_add, g_dbg_glu;
 
 // load the chain engines (norm/add/glu); returns true when all available
 static void axcl_chain_load() {
@@ -685,6 +704,7 @@ static void axcl_chain_load() {
     char p[512];
     snprintf(p, sizeof(p), "%s/rmsnorm_h1024.axmodel", dir);
     bool ok = axcl_fused_load(&g_chain.norm, p, {"x", "w"}, {"y"});
+    if (!ok) fprintf(stderr, "[chain] FAIL norm\n");
     snprintf(p, sizeof(p), "%s/add_h1024.axmodel", dir);
     ok = ok && axcl_fused_load(&g_chain.add, p, {"a", "b"}, {"y"});
     snprintf(p, sizeof(p), "%s/glu2_h3072.axmodel", dir);
@@ -1410,51 +1430,36 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             break;
         }
         case GGML_OP_FLASH_ATTN_EXT: {
-            // flash attention: src0=Q [D,nq,HQ,1], src1=K [D,seq,HKV,1], src2=V [seq,D,HKV,1]
-            // route to our fused attention engine; K/V stay device-resident.
-            // Batched prefill runs one engine call per token with a causal mask
-            // (the engine computes single-query attention).
+            // flash attention actual shapes (measured):
+            //   Q [D, nq, HQ] token stride nb[1], head stride nb[2]
+            //   K [D, seq, HKV] token stride nb[1], head slice = hk*D elems
+            //   V [D, seq, HKV] same as K
+            // out has Q's shape. The engine computes single-query attention;
+            // batched prefill runs one call per token with a causal mask.
             if (g_attn.model == 0 || !src0 || !src1 || !node->src[2]) return false;
             const struct ggml_tensor * qt = src0;
             const struct ggml_tensor * kt = src1;
             const struct ggml_tensor * vt = node->src[2];
             const int HQ = 16, D = 128, HKV = 8;
             if (qt->ne[0] != D || kt->ne[2] != HKV) return false; // wrong head config
-            {
-                static int dbg = getenv("GGML_AXCL_DEBUG_FA") ? 6 : 0;
-                if (dbg > 0) {
-                    dbg--;
-                    fprintf(stderr, "[fa-dbg] Q ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ty=%d | K ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ty=%d | V ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] ty=%d | out ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
-                        (long long)qt->ne[0],(long long)qt->ne[1],(long long)qt->ne[2],(long long)qt->ne[3], qt->nb[0],qt->nb[1],qt->nb[2],qt->nb[3], (int)qt->type,
-                        (long long)kt->ne[0],(long long)kt->ne[1],(long long)kt->ne[2],(long long)kt->ne[3], kt->nb[0],kt->nb[1],kt->nb[2],kt->nb[3], (int)kt->type,
-                        (long long)vt->ne[0],(long long)vt->ne[1],(long long)vt->ne[2],(long long)vt->ne[3], vt->nb[0],vt->nb[1],vt->nb[2],vt->nb[3], (int)vt->type,
-                        (long long)node->ne[0],(long long)node->ne[1],(long long)node->ne[2],(long long)node->ne[3], node->nb[0],node->nb[1],node->nb[2],node->nb[3]);
-                }
-            }
             const int nq = (int) qt->ne[1];
             const int seq_total = (int) kt->ne[1];
             if (seq_total > g_attn.t) return false; // context too long for engine
 
-            // K/V stay resident on the device: only tokens not yet uploaded are
-            // shipped (K view stride: token = nb[1]; V view is transposed so
-            // token = nb[0])
             void * dk = nullptr, * dv = nullptr;
-            if (!axcl_attn_sync_kv(kt->data, vt->data, kt->nb[1], vt->nb[0],
+            if (!axcl_attn_sync_kv(kt->data, vt->data, kt->nb[1], vt->nb[1],
                                    kt->type, vt->type, seq_total, HKV, &dk, &dv)) return false;
 
             const int base = seq_total - nq; // first cache slot of this ubatch
             static float eq[16 * 128];
             const size_t kv_bytes = (size_t)HQ * g_attn.t * D * 4;
-            for (int tq = 0; tq < nq; tq++) {
-                const int seq_t = base + tq + 1; // causal: token sees [0, base+tq]
-                // repack Q token tq: [D, nq, HQ] → engine [HQ, D]
+            for (int tq_i = 0; tq_i < nq; tq_i++) {
+                const int seq_t = base + tq_i + 1; // causal: token sees [0, base+tq_i]
                 for (int h = 0; h < HQ; h++)
                     for (int d = 0; d < D; d++)
                         eq[h * D + d] = *(const float *)((const char *)qt->data +
-                            (size_t)tq * qt->nb[1] + (size_t)d * qt->nb[0] + (size_t)h * qt->nb[2]);
-                // mask: 0 for valid, -1e9 beyond
+                            (size_t)tq_i * qt->nb[1] + (size_t)d * qt->nb[0] + (size_t)h * qt->nb[2]);
                 for (int t = 0; t < g_attn.t; t++) g_attn.m_buf[t] = (t < seq_t) ? 0.0f : -1e9f;
-
                 axclrtMemcpy(g_attn.dq, eq, (size_t)HQ * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
                 axclrtMemcpy(g_attn.dm, g_attn.m_buf.data(), g_attn.t * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
                 axclrtEngineSetInputBufferByIndex(g_attn.io, g_attn.iq, g_attn.dq, (size_t)HQ * D * 4);
@@ -1467,38 +1472,15 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
                     return false;
                 }
                 axclrtMemcpy(g_attn.out_buf.data(), g_attn.dout, (size_t)HQ * D * 4, AXCL_MEMCPY_DEVICE_TO_HOST);
-
-                // unpack: engine [HQ, D] → node [D, nq, HQ]
                 for (int h = 0; h < HQ; h++)
                     for (int d = 0; d < D; d++)
-                        *(float *)((char *)node->data + (size_t)tq * node->nb[1] +
+                        *(float *)((char *)node->data + (size_t)tq_i * node->nb[1] +
                             (size_t)d * node->nb[0] + (size_t)h * node->nb[2]) =
                             g_attn.out_buf[h * D + d];
             }
             break;
         }
-        case GGML_OP_DIAG_MASK_INF: {
-            // CPU semantics: causal DIAGONAL mask — row j masks positions
-            // i > n_past + j; copy src first when not in-place
-            int32_t n_past = 0;
-            if (node->op_params) memcpy(&n_past, node->op_params, sizeof(int32_t));
-            if (n_past < 0) n_past = 0;
-            if (src0 && src0->data != node->data && src0->data && node->data) {
-                memcpy(node->data, src0->data, ggml_nbytes(node));
-            }
-            const int64_t nc = node->ne[0];
-            const int64_t nrj = node->ne[1];
-            const int64_t nz = ggml_nrows(node) / (nrj ? nrj : 1);
-            for (int64_t k = 0; k < nz; k++) {
-                for (int64_t j = 0; j < nrj; j++) {
-                    float * dr = (float *)((char *)node->data + k * node->nb[2] + j * node->nb[1]);
-                    for (int64_t i = n_past; i < nc; i++) {
-                        if (i > n_past + j) dr[i] = -INFINITY;
-                    }
-                }
-            }
-            break;
-        }
+
         default:
             return false;
     }
@@ -1664,6 +1646,69 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         // sharing src1. Executed at the FIRST node — computing late (at the
         // v node) violates the allocator's lifetime assumptions and corrupts
         // downstream reads via reused chunks.
+        // fused rmsnorm+qkv: intercept the q_proj whose src1 is a norm node —
+        // one engine call replaces the norm engine + qkv fusion
+        if (node->op == GGML_OP_MUL_MAT && g_chain.qkvn.model != 0 &&
+            node->src[1]->ne[1] == 1 && getenv("GGML_AXCL_NO_FUSION") == nullptr &&
+            node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 2048 &&
+            node->src[1]->op == GGML_OP_MUL &&
+            node->src[1]->src[0] != nullptr && node->src[1]->src[0]->op == GGML_OP_RMS_NORM) {
+            // src1 = MUL(norm_out, w); h = the pre-norm hidden, w = gain
+            struct ggml_tensor * muln = node->src[1];
+            struct ggml_tensor * nrm = muln->src[0];
+            struct ggml_tensor * nrm_w = muln->src[1];
+            struct ggml_tensor * h = nrm->src[0];
+            // find k/v projections in the window (same src1 = the norm node)
+            struct ggml_tensor * n1 = nullptr, * n2 = nullptr;
+            int i1 = -1, i2 = -1;
+            for (int w = i + 1; w < cgraph->n_nodes && w < i + 8; w++) {
+                struct ggml_tensor * cand = cgraph->nodes[w];
+                if (cand->op == GGML_OP_MUL_MAT && cand->src[1] == muln &&
+                    cand->src[0]->ne[0] == 1024 && cand->src[0]->ne[1] == 1024 &&
+                    !done.count(w)) {
+                    if (n1 == nullptr) { n1 = cand; i1 = w; }
+                    else               { n2 = cand; i2 = w; break; }
+                }
+            }
+            if (n2 != nullptr) {
+                // run fused norm+qkv now (h is ready: topo order)
+                float h_buf[1024];
+                if (h->type == GGML_TYPE_F32) memcpy(h_buf, h->data, 1024*4);
+                else {
+                    const auto * tr = ggml_get_type_traits(h->type);
+                    if (!tr || !tr->to_float) { /* fall through to old path */ }
+                    else tr->to_float(h->data, h_buf, 1024);
+                }
+                void * dnw = nrm_w ? axcl_chain_stage_w(&g_chain.qkvn, nrm_w, 1024*4) : nullptr;
+                void * dqw = axcl_fused_stage_w(&g_chain.qkvn, node->src[0], (size_t)1024*2048*4);
+                void * dkw = axcl_fused_stage_w(&g_chain.qkvn, n1->src[0], (size_t)1024*1024*4);
+                void * dvw = axcl_fused_stage_w(&g_chain.qkvn, n2->src[0], (size_t)1024*1024*4);
+                if (dnw && dqw && dkw && dvw) {
+                    std::lock_guard<std::mutex> lock(axcl_exec_mutex);
+                    axclrtMemcpy(g_chain.qkvn.dev_in[0], h_buf, 1024*4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                    axclrtEngineSetInputBufferByIndex(g_chain.qkvn.io, 0, g_chain.qkvn.dev_in[0], 1024*4);
+                    axclrtEngineSetInputBufferByIndex(g_chain.qkvn.io, 1, dnw, 1024*4);
+                    axclrtEngineSetInputBufferByIndex(g_chain.qkvn.io, 2, dqw, (size_t)1024*2048*4);
+                    axclrtEngineSetInputBufferByIndex(g_chain.qkvn.io, 3, dkw, (size_t)1024*1024*4);
+                    axclrtEngineSetInputBufferByIndex(g_chain.qkvn.io, 4, dvw, (size_t)1024*1024*4);
+                    axclrtEngineSetOutputBufferByIndex(g_chain.qkvn.io, 0, g_chain.qkvn.dev_out[0], 2048*4);
+                    axclrtEngineSetOutputBufferByIndex(g_chain.qkvn.io, 1, g_chain.qkvn.dev_out[1], 1024*4);
+                    axclrtEngineSetOutputBufferByIndex(g_chain.qkvn.io, 2, g_chain.qkvn.dev_out[2], 1024*4);
+                    if (axclrtEngineExecute(g_chain.qkvn.model, g_chain.qkvn.ectx, 0, g_chain.qkvn.io) == AXCL_SUCC) {
+                        g_dbg_qkvn++;
+                        axclrtMemcpy(node->data, g_chain.qkvn.dev_out[0], 2048*4, AXCL_MEMCPY_DEVICE_TO_HOST);
+                        axclrtMemcpy(n1->data, g_chain.qkvn.dev_out[1], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
+                        axclrtMemcpy(n2->data, g_chain.qkvn.dev_out[2], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
+                        // mark the norm node done if it is immediately before
+                        done.insert(i1); done.insert(i2);
+                        for (int w = i - 1; w >= 0 && i - w < 4; w--) {
+                            if (cgraph->nodes[w] == nrm || cgraph->nodes[w] == muln) { done.insert(w); }
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
         if (node->op == GGML_OP_MUL_MAT && g_qkv.model != 0 &&
             node->src[1]->ne[1] == 1 && getenv("GGML_AXCL_NO_FUSION") == nullptr &&
             node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 2048) {
@@ -1683,7 +1728,9 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             }
             if (n2 != nullptr) {
                 xqkv_q[0] = node; xqkv_q[1] = n1; xqkv_q[2] = n2; xqkv_count = 3;
+                uint64_t tt_q = axcl_us();
                 const bool ok = axcl_qkv_try_flush();
+                prof_t_qkv += axcl_us() - tt_q; prof_n_qkv++;
                 if (ok) {
                     done.insert(i1); done.insert(i2);
                     // no map inserts: q/k/v consumers (rope, set_rows) read
@@ -1705,15 +1752,15 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 3072 &&
                 n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 3072 &&
                 !done.count(i) && !done.count(i1)) {
-                if (axcl_gate_up_run(node->src[1], node->src[0], n1->src[0],
-                                      (float *) node->data, (float *) n1->data)) {
+                uint64_t tt_g = axcl_us();
+                const bool gok = axcl_gate_up_run(node->src[1], node->src[0], n1->src[0],
+                                      (float *) node->data, (float *) n1->data);
+                prof_t_gateup += axcl_us() - tt_g; prof_n_gateup++;
+                if (gok) {
                     done.insert(i1); // skip the up node below
                     continue;         // gate node's output written by the engine
                 }
             }
-        }
-        if (ggml_axcl_host_op(node)) {
-            continue; // fused host-side: no backend boundary
         }
         // device-resident chain: small ops run as NPU engines, activations
         // stay on the card between engine calls (GGML_AXCL_CHAIN=1).
@@ -1724,7 +1771,12 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             if (ops_env != nullptr && ops_buf[0] == 0) {
                 snprintf(ops_buf, sizeof(ops_buf), ",%s,", ops_env);
             }
-            const bool ops_all = (ops_env == nullptr);
+            // default: only call-eliminating fusions; the standalone small-op
+            // engines add PCIe round-trips vs microsecond host scalars
+            const bool ops_all = false;
+            if (ops_env == nullptr) {
+                snprintf(ops_buf, sizeof(ops_buf), ",qkvn,addnorm,gludown,");
+            }
             auto op_enabled = [&](const char * n) -> bool {
                 if (ops_all) return true;
                 char want[32];
@@ -1732,30 +1784,119 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 return strstr(ops_buf, want) != nullptr;
             };
             if (node->op == GGML_OP_GET_ROWS) {
+                static const char * cnt = getenv("GGML_AXCL_CNT");
+                if (cnt) fprintf(stderr, "[cnt] qkvn=%d addnorm=%d gludown=%d norm=%d add=%d glu=%d\n",
+                    g_dbg_qkvn, g_dbg_addnorm, g_dbg_gludown, g_dbg_norm, g_dbg_add, g_dbg_glu);
                 g_chain.dev.clear(); // new forward pass begins
-            } else if (node->op == GGML_OP_RMS_NORM && node->ne[0] == 1024 &&
-                       node->src[1] != nullptr && node->src[1]->ne[0] == 1024 &&
-                       op_enabled("norm")) {
-                size_t ib[2] = {1024*4, 1024*4};
-                if (axcl_chain_stage_w(&g_chain.norm, node->src[1], 1024*4) != nullptr &&
-                    axcl_chain_run(&g_chain.norm, node, ib, 2, 1024*4, false)) {
-                    continue;
+            } else if (node->op == GGML_OP_MUL && node->ne[0] == 1024 && node->ne[1] == 1 &&
+                       ((node->src[0] != nullptr && node->src[0]->op == GGML_OP_RMS_NORM &&
+                         node->src[1] != nullptr && node->src[1]->ne[0] == 1024) ||
+                        (node->src[1] != nullptr && node->src[1]->op == GGML_OP_RMS_NORM &&
+                         node->src[0] != nullptr && node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 1))) {
+                // this graph applies the norm weight as a separate MUL; the
+                // RMS_NORM beneath it carries no weight input. Either side of
+                // the MUL can be the norm output — identify by op.
+                struct ggml_tensor * nrm = (node->src[0]->op == GGML_OP_RMS_NORM) ? node->src[0] : node->src[1];
+                struct ggml_tensor * wgt = (nrm == node->src[0]) ? node->src[1] : node->src[0];
+                struct ggml_tensor * xin = nrm->src[0];
+                if (xin != nullptr && xin->op == GGML_OP_ADD && xin->ne[0] == 1024 &&
+                    g_chain.addnorm.model != 0 && op_enabled("addnorm")) {
+                    // fused residual-add + rmsnorm + weight
+                    void * dwv = axcl_chain_stage_w(&g_chain.addnorm, wgt, 1024*4);
+                    if (dwv != nullptr) {
+                        std::lock_guard<std::mutex> lock(axcl_exec_mutex);
+                        axclrtMemcpy(g_chain.addnorm.dev_in[0], xin->src[0]->data, 1024*4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                        axclrtMemcpy(g_chain.addnorm.dev_in[1], xin->src[1]->data, 1024*4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                        axclrtEngineSetInputBufferByIndex(g_chain.addnorm.io, 0, g_chain.addnorm.dev_in[0], 1024*4);
+                        axclrtEngineSetInputBufferByIndex(g_chain.addnorm.io, 1, g_chain.addnorm.dev_in[1], 1024*4);
+                        axclrtEngineSetInputBufferByIndex(g_chain.addnorm.io, 2, dwv, 1024*4);
+                        axclrtEngineSetOutputBufferByIndex(g_chain.addnorm.io, 0, g_chain.addnorm.dev_out[0], 1024*4);
+                        if (axclrtEngineExecute(g_chain.addnorm.model, g_chain.addnorm.ectx, 0, g_chain.addnorm.io) == AXCL_SUCC) {
+                            g_dbg_addnorm++;
+                            axclrtMemcpy(node->data, g_chain.addnorm.dev_out[0], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
+                            // skip the ADD and RMS_NORM beneath us
+                            for (int w = i - 1; w >= 0 && i - w < 4; w--) {
+                                if (cgraph->nodes[w] == nrm || cgraph->nodes[w] == xin) done.insert(w);
+                            }
+                            continue;
+                        }
+                    }
+                } else if (op_enabled("norm")) {
+                    size_t ib2[2] = {1024*4, 1024*4};
+                    struct ggml_tensor * keep[2] = { xin, wgt };
+                    // inline: run norm engine on (x, w)
+                    void * dwv = axcl_chain_stage_w(&g_chain.norm, wgt, 1024*4);
+                    if (dwv != nullptr && xin != nullptr) {
+                        std::lock_guard<std::mutex> lock(axcl_exec_mutex);
+                        axclrtMemcpy(g_chain.norm.dev_in[0], xin->data, 1024*4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                        axclrtEngineSetInputBufferByIndex(g_chain.norm.io, 0, g_chain.norm.dev_in[0], 1024*4);
+                        axclrtEngineSetInputBufferByIndex(g_chain.norm.io, 1, dwv, 1024*4);
+                        axclrtEngineSetOutputBufferByIndex(g_chain.norm.io, 0, g_chain.norm.dev_out[0], 1024*4);
+                        if (axclrtEngineExecute(g_chain.norm.model, g_chain.norm.ectx, 0, g_chain.norm.io) == AXCL_SUCC) {
+                            g_dbg_norm++;
+                            axclrtMemcpy(node->data, g_chain.norm.dev_out[0], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
+                            for (int w = i - 1; w >= 0 && i - w < 4; w--) {
+                                if (cgraph->nodes[w] == nrm) done.insert(w);
+                            }
+                            (void) keep;
+                            continue;
+                        }
+                    }
                 }
             } else if (node->op == GGML_OP_ADD && node->ne[0] == 1024 && node->ne[1] == 1 &&
                        node->src[0]->ne[0] == 1024 && node->src[1]->ne[0] == 1024 &&
                        op_enabled("add")) {
                 size_t ib[2] = {1024*4, 1024*4};
                 if (axcl_chain_run(&g_chain.add, node, ib, 2, 1024*4)) {
+                    g_dbg_add++;
                     continue;
                 }
-            } else if (node->op == GGML_OP_GLU && node->ne[0] == 3072 && node->src[0]->ne[0] == 3072 &&
+            } else if (node->op == GGML_OP_GLU && node->ne[1] == 1 && node->ne[0] == 3072 &&
+                       node->src[0]->ne[0] == 3072 &&
                        node->src[1] != nullptr && node->src[1]->ne[0] == 3072 &&
                        op_enabled("glu")) {
                 size_t ib[2] = {3072*4, 3072*4};
                 if (axcl_chain_run(&g_chain.glu, node, ib, 2, 3072*4)) {
+                    g_dbg_glu++;
                     continue;
                 }
             }
+        }
+        if (node->op == GGML_OP_MUL_MAT &&
+            node->src[0]->ne[0] == 3072 && node->src[0]->ne[1] == 1024 &&
+            node->src[1] != nullptr && node->src[1]->op == GGML_OP_GLU &&
+            node->src[1]->ne[0] == 3072 && g_chain.gludown.model != 0 &&
+            node->src[1]->ne[1] == 1) {
+            // fused SwiGLU + down projection: g/u are the GLU inputs (gate/up
+            // projections), dw is the down weight — one call replaces the GLU
+            // engine, the down matmul, and the X upload entirely
+            struct ggml_tensor * glun = node->src[1];
+            void * ddw = axcl_fused_stage_w(&g_chain.gludown, node->src[0], (size_t)3072*1024*4);
+            if (ddw != nullptr) {
+                std::lock_guard<std::mutex> lock(axcl_exec_mutex);
+                axclrtMemcpy(g_chain.gludown.dev_in[0], glun->src[0]->data, 3072*4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                axclrtMemcpy(g_chain.gludown.dev_in[1], glun->src[1]->data, 3072*4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                axclrtEngineSetInputBufferByIndex(g_chain.gludown.io, 0, g_chain.gludown.dev_in[0], 3072*4);
+                axclrtEngineSetInputBufferByIndex(g_chain.gludown.io, 1, g_chain.gludown.dev_in[1], 3072*4);
+                axclrtEngineSetInputBufferByIndex(g_chain.gludown.io, 2, ddw, (size_t)3072*1024*4);
+                axclrtEngineSetOutputBufferByIndex(g_chain.gludown.io, 0, g_chain.gludown.dev_out[0], 1024*4);
+                if (axclrtEngineExecute(g_chain.gludown.model, g_chain.gludown.ectx, 0, g_chain.gludown.io) == AXCL_SUCC) {
+                    g_dbg_gludown++;
+                    axclrtMemcpy(node->data, g_chain.gludown.dev_out[0], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
+                    g_chain.dev[node->data] = g_chain.gludown.dev_out[0];
+                    // mark the GLU node done (it never runs separately)
+                    for (int w = i - 1; w >= 0 && i - w < 3; w--) {
+                        if (cgraph->nodes[w] == glun) { done.insert(w); break; }
+                    }
+                    continue;
+                }
+            }
+        }
+        {
+            uint64_t tt_h = axcl_us();
+            bool hok = ggml_axcl_host_op(node);
+            prof_t_host += axcl_us() - tt_h; prof_n_host++;
+            if (hok) continue;
         }
         if (node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor * src0 = node->src[0];
@@ -1799,6 +1940,10 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 // (approximate: assumes dim0/1 contiguous pairing good enough for a fingerprint)
             }
             axcl_matmul *        mm   = src1->ne[1] == 1 ? axcl_matmul_get(src0->ne[0], src0->ne[1]) : nullptr;
+            if (src0->ne[1] == 151936 && getenv("GGML_AXCL_CNT")) {
+                fprintf(stderr, "[cnt] qkvn=%d addnorm=%d gludown=%d norm=%d add=%d glu=%d\n",
+                        g_dbg_qkvn, g_dbg_addnorm, g_dbg_gludown, g_dbg_norm, g_dbg_add, g_dbg_glu);
+            }
             if (mm != nullptr) {
                 if (!ggml_axcl_compute_mul_mat(mm, src0, src1, node)) {
                     GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT failed\n", i);
@@ -1837,8 +1982,11 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                                     (size_t)d * qt->nb[0] + (size_t)h * qt->nb[2]);
                         // K view is [seq, D, HKV] (token stride nb[0]); V view is
                         // [D, seq, HKV] (token stride nb[1])
-                        if (axcl_attn_run(eq, kt->data, vt->data, kt->nb[0], vt->nb[1],
-                                          kt->type, vt->type, seq, HKV, D, out_flat)) {
+                        uint64_t tt_a = axcl_us();
+                        bool aok2 = axcl_attn_run(eq, kt->data, vt->data, kt->nb[0], vt->nb[1],
+                                          kt->type, vt->type, seq, HKV, D, out_flat);
+                        prof_t_attn += axcl_us() - tt_a; prof_n_attn++;
+                        if (aok2) {
                             // unpack: [HQ, D] → node [D, 1, HQ]
                             for (int h = 0; h < HQ; h++)
                                 for (int d = 0; d < D; d++)
@@ -2175,11 +2323,7 @@ static ggml_backend_t ggml_backend_axcl_device_init_backend(ggml_backend_dev_t d
 static ggml_backend_buffer_type_t ggml_backend_axcl_device_get_buffer_type(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
     // Host-memory backend (same contract as ggml-blas): compute reads and
-    // writes tensors directly in host RAM. Using the CPU buffer type is what
-    // BLAS does — a private buffer type that is not marked is_host makes the
-    // scheduler treat our host memory as opaque device memory and route
-    // cross-backend tensor access through its device-copy machinery, which
-    // produced corrupted (stale, aliased) tensor contents.
+    // writes tensors directly in host RAM.
     return ggml_backend_cpu_buffer_type();
 }
 
@@ -2259,8 +2403,10 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
             case GGML_OP_RESHAPE:
             case GGML_OP_TRANSPOSE:
             case GGML_OP_CONT:
-            case GGML_OP_FLASH_ATTN_EXT:
                 return false;
+            case GGML_OP_FLASH_ATTN_EXT:
+                return false; // CPU flash-attn: our engine's FA output is
+                              // wrong under investigation (strides TBD)
             default:
                 return true;
         }
