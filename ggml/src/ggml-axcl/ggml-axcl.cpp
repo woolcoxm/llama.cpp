@@ -1118,6 +1118,32 @@ static bool axcl_gate_up_run(struct ggml_tensor * h, struct ggml_tensor * gate_w
     return true;
 }
 
+// cross-split QKV state: projections may land in separate graph splits
+static struct ggml_tensor * xqkv_norm_out = nullptr;  // RMS_NORM output (h_normed)
+static struct ggml_tensor * xqkv_hidden = nullptr;    // RMS_NORM input (hidden)
+static struct ggml_tensor * xqkv_norm_w = nullptr;    // norm weight
+static struct ggml_tensor * xqkv_q[3] = {nullptr, nullptr, nullptr}; // q/k/v projection nodes
+static int xqkv_count = 0;
+
+static void axcl_qkv_try_flush() {
+    if (xqkv_count != 3 || g_qkv.model == 0) {
+        // reset if partial
+        if (xqkv_count > 0) {
+            xqkv_count = 0; xqkv_norm_out = xqkv_hidden = xqkv_norm_w = nullptr;
+            xqkv_q[0] = xqkv_q[1] = xqkv_q[2] = nullptr;
+        }
+        return;
+    }
+    // have all 3 projections: execute QKV engine
+    if (axcl_qkv_run(xqkv_hidden, xqkv_norm_w,
+                     xqkv_q[0]->src[0], xqkv_q[1]->src[0], xqkv_q[2]->src[0],
+                     (float *) xqkv_q[0]->data, (float *) xqkv_q[1]->data, (float *) xqkv_q[2]->data)) {
+        fprintf(stderr, "[axcl-fuse] QKV flushed (3 projections -> 1 engine call)\n");
+    }
+    xqkv_count = 0; xqkv_norm_out = xqkv_hidden = xqkv_norm_w = nullptr;
+    xqkv_q[0] = xqkv_q[1] = xqkv_q[2] = nullptr;
+}
+
 static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_axcl_context * ctx = (ggml_backend_axcl_context *) backend->context;
     axclrtSetDevice(axcl_get_device_index(ctx->device));
@@ -1136,8 +1162,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         for (int i = 0; i + 3 < cgraph->n_nodes; i++) {
             struct ggml_tensor * n0 = cgraph->nodes[i];
 
-            // Pattern 1: RMS_NORM → Q_proj → K_proj → V_proj (4 consecutive)
-            if (n0->op == GGML_OP_RMS_NORM && g_qkv.model != 0) {
+            if (n0->op == GGML_OP_RMS_NORM && g_qkv.model != 0 && false) { // handled by cross-split state
                 struct ggml_tensor * n1 = cgraph->nodes[i+1];
                 struct ggml_tensor * n2 = cgraph->nodes[i+2];
                 struct ggml_tensor * n3 = cgraph->nodes[i+3];
@@ -1183,8 +1208,30 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
             continue; // metadata-only: data pointer already correct
         }
-        if (ggml_axcl_host_op(node)) {
-            continue; // fused host-side: no backend boundary
+        // cross-split QKV detection: buffer norm output + projections
+        if (node->op == GGML_OP_RMS_NORM && g_qkv.model != 0) {
+            xqkv_norm_out = node;
+            xqkv_hidden = node->src[0];
+            xqkv_norm_w = node->src[1];
+            xqkv_count = 0;
+            // still compute the norm host-side (the engine result will
+            // overwrite the projections' outputs, not the norm itself)
+            ggml_axcl_host_op(node);
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT && xqkv_norm_out != nullptr && xqkv_count < 3 &&
+            node->src[1] == xqkv_norm_out) {
+            // this projection uses the cached norm output: buffer it
+            const int64_t n = node->src[0]->ne[1]; // output dim
+            // q: (1024, 2048), k: (1024, 1024), v: (1024, 1024)
+            if (node->src[0]->ne[0] == 1024 && (n == 2048 || n == 1024)) {
+                xqkv_q[xqkv_count++] = node;
+                if (xqkv_count == 3) {
+                    axcl_qkv_try_flush();
+                }
+                // skip individual compute: engine already wrote the output
+                continue;
+            }
         }
         if (node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor * src0 = node->src[0];
