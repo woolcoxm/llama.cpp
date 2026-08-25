@@ -291,11 +291,13 @@ struct axcl_matmul {
 
     // canonical axcl-samples pattern: DEVICE buffers bound to the engine IO
     // (host pointers are rejected card-side at execute time), plus host
-    // staging used through axclrtMemcpy
+    // staging used through axclrtMemcpy. Staging lives in PINNED host memory
+    // (axclrtMallocHost): regular malloc costs ~1ms per small H2D (page
+    // pinning per transfer); pinned drops it to tens of microseconds.
     void * dx = nullptr;                 // f32 [K]
     void * dw = nullptr;                 // f32 [K, N] (transposed weights)
     void * dy = nullptr;                 // f32 [N]
-    std::vector<float> x_h, y_h;        // host staging (per-call)
+    float * x_h = nullptr, * y_h = nullptr; // pinned host staging
     // upload-once weight staging: many weight tensors share one engine shape
     // (every layer's k_proj is the same (k,n)) so device buffers are keyed
     // by the weight tensor's data pointer, not the engine
@@ -661,6 +663,108 @@ static std::string axcl_matmul_model_path(int64_t k, int64_t n) {
 // the AXCL engine IO is not thread-safe: serialize loads and executes
 static std::mutex axcl_exec_mutex;
 
+// device-resident chain: activations flow engine -> engine without host
+// round-trips. g_chain_x_override lets compute_mul_mat bind a device buffer
+// as X directly (set by the chain runner before dispatching a MUL_MAT).
+static void * g_chain_x_override = nullptr;
+
+// tensor data ptr -> device buffer holding its current value. Entries are
+// valid only in topological order (engine output buffers get reused); the
+// map is cleared whenever a new forward pass starts (GET_ROWS node).
+struct axcl_chain {
+    axcl_fused_engine norm, add, glu;
+    bool engines_ok = false;
+    std::unordered_map<const void *, void *> dev;
+};
+static axcl_chain g_chain;
+
+// load the chain engines (norm/add/glu); returns true when all available
+static void axcl_chain_load() {
+    if (g_chain.norm.model != 0 || g_chain.engines_ok) return;
+    const char * dir = "/usr/local/share/ggml-axcl/chain";
+    char p[512];
+    snprintf(p, sizeof(p), "%s/rmsnorm_h1024.axmodel", dir);
+    bool ok = axcl_fused_load(&g_chain.norm, p, {"x", "w"}, {"y"});
+    snprintf(p, sizeof(p), "%s/add_h1024.axmodel", dir);
+    ok = ok && axcl_fused_load(&g_chain.add, p, {"a", "b"}, {"y"});
+    snprintf(p, sizeof(p), "%s/glu2_h3072.axmodel", dir);
+    ok = ok && axcl_fused_load(&g_chain.glu, p, {"g", "u"}, {"y"});
+    if (ok) {
+        axcl_fused_alloc(&g_chain.norm, {1024*4, 1024*4}, {1024*4});
+        axcl_fused_alloc(&g_chain.add,  {1024*4, 1024*4}, {1024*4});
+        axcl_fused_alloc(&g_chain.glu,  {3072*4, 3072*4}, {3072*4});
+        g_chain.engines_ok = true;
+        GGML_LOG_INFO("ggml-axcl: chain engines loaded (norm/add/glu)\n");
+    }
+}
+
+// stage a 1-D weight (norm gains etc.): dequant if needed, upload once
+static void * axcl_chain_stage_w(axcl_fused_engine * fe, const struct ggml_tensor * w, size_t bytes) {
+    auto it = fe->staged_w.find(w->data);
+    if (it != fe->staged_w.end()) return it->second;
+    void * dev = nullptr;
+    axclrtMalloc(&dev, bytes, AXCL_MEM_MALLOC_HUGE_FIRST);
+    if (dev == nullptr) return nullptr;
+    if (w->type == GGML_TYPE_F32) {
+        axclrtMemcpy(dev, w->data, bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
+    } else {
+        fe->scratch.resize(bytes / 4);
+        const auto * tr = ggml_get_type_traits(w->type);
+        if (tr && tr->to_float) tr->to_float(w->data, fe->scratch.data(), (int64_t)(bytes / 4));
+        axclrtMemcpy(dev, fe->scratch.data(), bytes, AXCL_MEMCPY_HOST_TO_DEVICE);
+    }
+    fe->staged_w[w->data] = dev;
+    return dev;
+}
+
+// fetch a device buffer for a tensor's current value; nullptr = host only.
+// POP semantics: the entry is consumed on read. ggml reuses tensor host
+// addresses within a graph, so a lingering entry would hand a later tensor
+// another tensor's device buffer — the single-consumer pop keeps the map
+// exact, and any second consumer falls back to the host write-back.
+static void * axcl_chain_get(const struct ggml_tensor * t) {
+    auto it = g_chain.dev.find(t->data);
+    if (it == g_chain.dev.end()) return nullptr;
+    void * p = it->second;
+    g_chain.dev.erase(it);
+    return p;
+}
+
+// record an engine output for tensor t + write it back to host memory
+static void axcl_chain_put(struct ggml_tensor * t, void * dev_out, size_t bytes) {
+    g_chain.dev[t->data] = dev_out;
+    axclrtMemcpy(t->data, dev_out, bytes, AXCL_MEMCPY_DEVICE_TO_HOST);
+}
+
+// run a small chain engine: inputs resolved from the device map when present
+// (H2D otherwise), output recorded + written back
+static bool axcl_chain_run(axcl_fused_engine * fe, struct ggml_tensor * node,
+                           const size_t * in_bytes, size_t n_in, size_t out_bytes,
+                           bool record = true) {
+    std::lock_guard<std::mutex> lock(axcl_exec_mutex);
+    for (size_t j = 0; j < n_in; j++) {
+        struct ggml_tensor * src = node->src[j];
+        void * devv = axcl_chain_get(src);
+        if (devv != nullptr) {
+            if (devv == fe->dev_out[0]) {
+                // alias hazard: the input IS this engine's previous output
+                // buffer (e.g. residual chains) — copy it aside first
+                axclrtMemcpy(fe->dev_in[j], devv, in_bytes[j], AXCL_MEMCPY_DEVICE_TO_DEVICE);
+                devv = fe->dev_in[j];
+            }
+            axclrtEngineSetInputBufferByIndex(fe->io, fe->in_idx[j], devv, in_bytes[j]);
+        } else {
+            axclrtMemcpy(fe->dev_in[j], src->data, in_bytes[j], AXCL_MEMCPY_HOST_TO_DEVICE);
+            axclrtEngineSetInputBufferByIndex(fe->io, fe->in_idx[j], fe->dev_in[j], in_bytes[j]);
+        }
+    }
+    axclrtEngineSetOutputBufferByIndex(fe->io, fe->out_idx[0], fe->dev_out[0], out_bytes);
+    if (axclrtEngineExecute(fe->model, fe->ectx, 0, fe->io) != AXCL_SUCC) return false;
+    axclrtMemcpy(node->data, fe->dev_out[0], out_bytes, AXCL_MEMCPY_DEVICE_TO_HOST);
+    if (record) g_chain.dev[node->data] = fe->dev_out[0];
+    return true;
+}
+
 static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
     if (!axcl_engine_global_init()) {
         return nullptr;
@@ -718,9 +822,13 @@ static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
     mm->w_idx = axclrtEngineGetInputIndexByName(mm->io_info, mm->w_name.c_str());
     mm->y_idx = axclrtEngineGetOutputIndexByName(mm->io_info, mm->y_name.c_str());
 
-    mm->x_h.resize(k);
     mm->w_h.resize(k * n);
-    mm->y_h.resize(n);
+    if (axclrtMallocHost((void **) &mm->x_h, (size_t) k * 4) != AXCL_SUCC ||
+        axclrtMallocHost((void **) &mm->y_h, (size_t) n * 4) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: pinned host alloc failed for %s\n", path.c_str());
+        delete mm;
+        return nullptr;
+    }
     if (axclrtMalloc(&mm->dx, (size_t) k * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
         axclrtMalloc(&mm->dw, (size_t) k * n * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
         axclrtMalloc(&mm->dy, (size_t) n * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC) {
@@ -846,9 +954,15 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
     const int64_t n = mm->n;
 
     // X: activation, src1 is [K, 1] f32 — may be a strided view (permuted
-    // attention tensors), so read element-wise unless contiguous
-    if (src1->nb[0] == 4) {
-        memcpy(mm->x_h.data(), src1->data, (size_t) k * 4);
+    // attention tensors), so read element-wise unless contiguous.
+    // In chain mode the activation may already be device-resident: bind it
+    // directly and skip the host staging + H2D entirely.
+    void * dev_x_override = g_chain_x_override;
+    g_chain_x_override = nullptr;
+    if (dev_x_override != nullptr) {
+        // device-resident X: bind directly below, no staging
+    } else if (src1->nb[0] == 4) {
+        memcpy(mm->x_h, src1->data, (size_t) k * 4);
     } else {
         for (int64_t kk = 0; kk < k; kk++)
             mm->x_h[kk] = *(const float *) ((const char *) src1->data + (size_t) kk * src1->nb[0]);
@@ -877,7 +991,8 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
     }
 
     auto t2 = std::chrono::steady_clock::now();
-    if (axclrtMemcpy(mm->dx, mm->x_h.data(), (size_t) k * 4, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC) {
+    if (dev_x_override == nullptr &&
+        axclrtMemcpy(mm->dx, mm->x_h, (size_t) k * 4, AXCL_MEMCPY_HOST_TO_DEVICE) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: X H2D failed\n");
         return false;
     }
@@ -890,7 +1005,8 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
     auto t3 = std::chrono::steady_clock::now();
 
     void * wbuf = w_uploaded ? dw : mm->dw;
-    if (axclrtEngineSetInputBufferByIndex(mm->io, mm->x_idx, mm->dx, (size_t) k * 4) != AXCL_SUCC ||
+    void * xbuf = dev_x_override != nullptr ? dev_x_override : mm->dx;
+    if (axclrtEngineSetInputBufferByIndex(mm->io, mm->x_idx, xbuf, (size_t) k * 4) != AXCL_SUCC ||
         axclrtEngineSetInputBufferByIndex(mm->io, mm->w_idx, wbuf, (size_t) k * n * 4) != AXCL_SUCC ||
         axclrtEngineSetOutputBufferByIndex(mm->io, mm->y_idx, mm->dy, (size_t) n * 4) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: bind device buffers failed\n");
@@ -905,11 +1021,11 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
         return false;
     }
 
-    if (axclrtMemcpy(mm->y_h.data(), mm->dy, (size_t) n * 4, AXCL_MEMCPY_DEVICE_TO_HOST) != AXCL_SUCC) {
+    if (axclrtMemcpy(mm->y_h, mm->dy, (size_t) n * 4, AXCL_MEMCPY_DEVICE_TO_HOST) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: D2H copy failed\n");
         return false;
     }
-    memcpy(dst->data, mm->y_h.data(), (size_t) n * 4);
+    memcpy(dst->data, mm->y_h, (size_t) n * 4);
     auto t6 = std::chrono::steady_clock::now();
 
     auto us = [](auto a, auto b) { return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count(); };
@@ -1027,22 +1143,34 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             break;
         }
         case GGML_OP_GLU: {
-            // fused activation gate: out = act(x[:h]) * x[h:], h = ne0/2
-            int glu;
-            memcpy(&glu, node->op_params, sizeof(glu));
-            const int64_t h = ne0 / 2;
+            // CPU semantics: two-input form gate=src0, up=src1; single-input
+            // form keeps both halves in src0 with the `swapped` op-param
+            // deciding which half is the gate
+            int32_t gp[2] = {0, 0};
+            memcpy(gp, node->op_params, sizeof(gp));
+            const int glu = gp[0];
+            const bool swapped = gp[1] != 0;
+            const bool two_in = src1 != nullptr;
+            const int64_t nc = two_in ? src0->ne[0] : src0->ne[0] / 2;
             for (int64_t r = 0; r < nr; r++) {
-                const float * x  = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
-                float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
-                for (int64_t i = 0; i < h; i++) {
-                    float a = x[i], b = x[h + i], act;
+                const float * a = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
+                const float * b = nullptr;
+                if (two_in) {
+                    b = (const float *) ((char *) src1->data + axcl_row_off(src1, r));
+                } else {
+                    b = a + (swapped ? 0 : nc);
+                    a = a + (swapped ? nc : 0);
+                }
+                float * dr = (float *) ((char *) node->data + axcl_row_off(node, r));
+                for (int64_t i = 0; i < nc; i++) {
+                    float x = a[i], y = b[i], act;
                     switch ((enum ggml_glu_op) glu) {
-                        case GGML_GLU_OP_REGLU:     act = a > 0 ? a : 0; break;
-                        case GGML_GLU_OP_GEGLU:     act = a * (1.0f / (1.0f + expf(-a))); break;
-                        case GGML_GLU_OP_SWIGLU_OAI: { float s = 1.0f + expf(-a); act = (a / s) * (a / s); } break;
-                        default:                    act = a / (1.0f + expf(-a)); break;
+                        case GGML_GLU_OP_REGLU:     act = x > 0 ? x : 0; break;
+                        case GGML_GLU_OP_GEGLU:     act = x * (1.0f / (1.0f + expf(-x))); break;
+                        case GGML_GLU_OP_SWIGLU_OAI: { float s = 1.0f + expf(-x); act = (x / s) * (x / s); } break;
+                        default:                    act = x / (1.0f + expf(-x)); break;
                     }
-                    dr[i] = act * b;
+                    dr[i] = act * y;
                 }
             }
             break;
@@ -1536,20 +1664,31 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         // sharing src1. Executed at the FIRST node — computing late (at the
         // v node) violates the allocator's lifetime assumptions and corrupts
         // downstream reads via reused chunks.
-        if (node->op == GGML_OP_MUL_MAT && g_qkv.model != 0 && i + 2 < cgraph->n_nodes &&
-            node->src[1]->ne[1] == 1 && getenv("GGML_AXCL_NO_FUSION") == nullptr) {
-            struct ggml_tensor * n1 = cgraph->nodes[i+1];
-            struct ggml_tensor * n2 = cgraph->nodes[i+2];
-            if (n1->op == GGML_OP_MUL_MAT && n2->op == GGML_OP_MUL_MAT &&
-                n1->src[1] == node->src[1] && n2->src[1] == node->src[1] &&
-                node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 2048 &&
-                n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 1024 &&
-                n2->src[0]->ne[0] == 1024 && n2->src[0]->ne[1] == 1024 &&
-                !done.count(i+1) && !done.count(i+2)) {
+        if (node->op == GGML_OP_MUL_MAT && g_qkv.model != 0 &&
+            node->src[1]->ne[1] == 1 && getenv("GGML_AXCL_NO_FUSION") == nullptr &&
+            node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 2048) {
+            // window scan: the graph interleaves q's norm/rope between the
+            // projections; executing the engine at the q node stays in
+            // topological order for all consumers
+            struct ggml_tensor * n1 = nullptr, * n2 = nullptr;
+            int i1 = -1, i2 = -1;
+            for (int w = i + 1; w < cgraph->n_nodes && w < i + 8; w++) {
+                struct ggml_tensor * cand = cgraph->nodes[w];
+                if (cand->op == GGML_OP_MUL_MAT && cand->src[1] == node->src[1] &&
+                    cand->src[0]->ne[0] == 1024 && cand->src[0]->ne[1] == 1024 &&
+                    !done.count(w)) {
+                    if (n1 == nullptr) { n1 = cand; i1 = w; }
+                    else               { n2 = cand; i2 = w; break; }
+                }
+            }
+            if (n2 != nullptr) {
                 xqkv_q[0] = node; xqkv_q[1] = n1; xqkv_q[2] = n2; xqkv_count = 3;
                 const bool ok = axcl_qkv_try_flush();
                 if (ok) {
-                    done.insert(i+1); done.insert(i+2);
+                    done.insert(i1); done.insert(i2);
+                    // no map inserts: q/k/v consumers (rope, set_rows) read
+                    // the host writebacks; lingering entries get consumed by
+                    // whichever tensor galloc assigns the same host address
                     continue;
                 }
                 // engine unavailable: fall through, compute nodes individually
@@ -1560,14 +1699,15 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         if (node->op == GGML_OP_MUL_MAT && g_gate_up.model != 0 && i + 1 < cgraph->n_nodes &&
             getenv("GGML_AXCL_NO_FUSION") == nullptr) {
             struct ggml_tensor * n1 = cgraph->nodes[i+1];
+            int i1 = i+1;
             if (n1->op == GGML_OP_MUL_MAT && n1->src[1] == node->src[1] &&
                 node->src[1]->ne[1] == 1 &&
                 node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 3072 &&
                 n1->src[0]->ne[0] == 1024 && n1->src[0]->ne[1] == 3072 &&
-                !done.count(i) && !done.count(i+1)) {
+                !done.count(i) && !done.count(i1)) {
                 if (axcl_gate_up_run(node->src[1], node->src[0], n1->src[0],
                                       (float *) node->data, (float *) n1->data)) {
-                    done.insert(i+1); // skip the up node below
+                    done.insert(i1); // skip the up node below
                     continue;         // gate node's output written by the engine
                 }
             }
@@ -1575,9 +1715,77 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         if (ggml_axcl_host_op(node)) {
             continue; // fused host-side: no backend boundary
         }
+        // device-resident chain: small ops run as NPU engines, activations
+        // stay on the card between engine calls (GGML_AXCL_CHAIN=1).
+        // GGML_AXCL_CHAIN_OPS="norm,add,glu" gates individual routes.
+        if (g_chain.engines_ok) {
+            static char ops_buf[128] = {0};
+            static const char * ops_env = getenv("GGML_AXCL_CHAIN_OPS");
+            if (ops_env != nullptr && ops_buf[0] == 0) {
+                snprintf(ops_buf, sizeof(ops_buf), ",%s,", ops_env);
+            }
+            const bool ops_all = (ops_env == nullptr);
+            auto op_enabled = [&](const char * n) -> bool {
+                if (ops_all) return true;
+                char want[32];
+                snprintf(want, sizeof(want), ",%s,", n);
+                return strstr(ops_buf, want) != nullptr;
+            };
+            if (node->op == GGML_OP_GET_ROWS) {
+                g_chain.dev.clear(); // new forward pass begins
+            } else if (node->op == GGML_OP_RMS_NORM && node->ne[0] == 1024 &&
+                       node->src[1] != nullptr && node->src[1]->ne[0] == 1024 &&
+                       op_enabled("norm")) {
+                size_t ib[2] = {1024*4, 1024*4};
+                if (axcl_chain_stage_w(&g_chain.norm, node->src[1], 1024*4) != nullptr &&
+                    axcl_chain_run(&g_chain.norm, node, ib, 2, 1024*4, false)) {
+                    continue;
+                }
+            } else if (node->op == GGML_OP_ADD && node->ne[0] == 1024 && node->ne[1] == 1 &&
+                       node->src[0]->ne[0] == 1024 && node->src[1]->ne[0] == 1024 &&
+                       op_enabled("add")) {
+                size_t ib[2] = {1024*4, 1024*4};
+                if (axcl_chain_run(&g_chain.add, node, ib, 2, 1024*4)) {
+                    continue;
+                }
+            } else if (node->op == GGML_OP_GLU && node->ne[0] == 3072 && node->src[0]->ne[0] == 3072 &&
+                       node->src[1] != nullptr && node->src[1]->ne[0] == 3072 &&
+                       op_enabled("glu")) {
+                size_t ib[2] = {3072*4, 3072*4};
+                if (axcl_chain_run(&g_chain.glu, node, ib, 2, 3072*4)) {
+                    continue;
+                }
+            }
+        }
         if (node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor * src0 = node->src[0];
             struct ggml_tensor * src1 = node->src[1];
+            // chain: if the activation is device-resident, bind it as X.
+            // ALWAYS reset first — a previous MUL_MAT that routed to the
+            // attention path leaves the override set, and a stale pointer
+            // would corrupt the next matmul's input binding.
+            g_chain_x_override = nullptr;
+            if (g_chain.engines_ok && src1->ne[1] == 1 &&
+                getenv("GGML_AXCL_NO_OVERRIDE") == nullptr) {
+                void * hit = axcl_chain_get(src1);
+                // GGML_AXCL_OVR_K="3072,1024": restrict overrides to listed K
+                static const char * ovr_k = getenv("GGML_AXCL_OVR_K");
+                bool allowed = false; // default off: the glu->down handoff
+                if (ovr_k != nullptr) {  // corrupts; under investigation
+                    char want[32], buf[256];
+                    snprintf(want, sizeof(want), ",%lld,", (long long) src0->ne[0]);
+                    snprintf(buf, sizeof(buf), ",%s,", ovr_k);
+                    allowed = strstr(buf, want) != nullptr;
+                }
+                if (hit != nullptr && !allowed) {
+                    hit = nullptr; // entry consumed; consumer uses host data
+                }
+                g_chain_x_override = hit;
+                if (hit != nullptr && getenv("GGML_AXCL_DEBUG_OVR")) {
+                    fprintf(stderr, "[ovr] k=%lld n=%lld\n",
+                            (long long)src0->ne[0], (long long)src0->ne[1]);
+                }
+            }
             // checksum trace: GGML_AXCL_TRACEMM=1 prints src1/dst sums per node
             static int tracemm = getenv("GGML_AXCL_TRACEMM") ? 400 : 0;
             double xin = 0.0;
@@ -1595,6 +1803,9 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 if (!ggml_axcl_compute_mul_mat(mm, src0, src1, node)) {
                     GGML_LOG_ERROR("ggml-axcl: node %d MUL_MAT failed\n", i);
                     return GGML_STATUS_ABORTED;
+                }
+                if (g_chain.engines_ok) {
+                    g_chain.dev[node->data] = mm->dy; // host write-back already done
                 }
             } else {
                 // per-head attention matmuls (3D with ne[2]>1 for heads):
@@ -1854,6 +2065,9 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
         axcl_preload_all_engines(); // outside the activation mutex
         axcl_weight_pool_init();
         axcl_attn_load();
+        if (getenv("GGML_AXCL_CHAIN") != nullptr) {
+            axcl_chain_load();
+        }
         // QKV fused engine: rms_norm(hidden) -> q, k, v in one call
         if (axcl_fused_load(&g_qkv, "/usr/local/share/ggml-axcl/qkv_nn_h1024_q2048_kv1024.axmodel",
                             {"h", "q_w", "k_w", "v_w"}, {"q", "k", "v"})) {
@@ -2006,13 +2220,55 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
     // end-to-end. Claiming metadata ops (VIEW/PERMUTE) makes the scheduler's
     // split machinery create output copies we never write (metadata ops have
     // no compute), so downstream splits read stale copy buffers — corrupted
-    // K/V views. GGML_AXCL_UNIVERSAL=1 claims everything; broken until the
-    // host-op path is reworked to avoid split hazards.
+    // K/V views. GGML_AXCL_UNIVERSAL=2: claim all COMPUTE ops but leave
+    // metadata on the CPU — eliminates splits between our compute ops while
+    // avoiding the metadata split-copy hazard.
     static const char * uni_env = getenv("GGML_AXCL_UNIVERSAL");
-    if (uni_env == nullptr) {
-        return op->op == GGML_OP_MUL_MAT;
+    if (uni_env != nullptr && uni_env[0] == '2') {
+        switch (op->op) {
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_TRANSPOSE:
+                return false;
+            default:
+                return true;
+        }
     }
-    return true;
+    // GGML_AXCL_CLAIM="RMS_NORM,ADD": MUL_MAT plus exactly the listed ops —
+    // minimal bisect for the claim-hazard
+    static const char * claim_env = getenv("GGML_AXCL_CLAIM");
+    if (claim_env != nullptr) {
+        if (op->op == GGML_OP_MUL_MAT) return true;
+        char buf[512];
+        snprintf(buf, sizeof(buf), ",%s,", claim_env);
+        char name[64];
+        snprintf(name, sizeof(name), ",%s,", ggml_op_name(op->op));
+        return strstr(buf, name) != nullptr;
+    }
+    // GGML_AXCL_CHAIN=1: device-resident chain — claim every COMPUTE op.
+    // Metadata ops and CONT stay on the CPU; FLASH_ATTN_EXT must NOT be
+    // claimed: it flips llama.cpp to the FA path, and our FA host-op passes
+    // the permuted K view's strides to the attention engine incorrectly —
+    // the manual attention route is the verified-correct one.
+    static const char * chain_env = getenv("GGML_AXCL_CHAIN");
+    if (chain_env != nullptr) {
+        switch (op->op) {
+            case GGML_OP_VIEW:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_TRANSPOSE:
+            case GGML_OP_CONT:
+            case GGML_OP_FLASH_ATTN_EXT:
+                return false;
+            default:
+                return true;
+        }
+    }
+    if (uni_env != nullptr) {
+        return true;
+    }
+    return op->op == GGML_OP_MUL_MAT;
 }
 
 static bool ggml_backend_axcl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
