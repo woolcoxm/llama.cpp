@@ -840,6 +840,15 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
                 float * drow = (float *) ((char *) node->data + (size_t) r * node->nb[1]);
                 if (src0->type == GGML_TYPE_F32) {
                     memcpy(drow, srcrow, (size_t) nc * 4);
+                } else if (src0->type == GGML_TYPE_F16) {
+                    const ggml_fp16_t * h = (const ggml_fp16_t *) srcrow;
+                    for (int64_t i = 0; i < nc; i++) drow[i] = GGML_COMPUTE_FP16_TO_FP32(h[i]);
+                } else if (src0->type == GGML_TYPE_BF16) {
+                    const uint16_t * h = (const uint16_t *) srcrow;
+                    for (int64_t i = 0; i < nc; i++) {
+                        uint32_t u = (uint32_t) h[i] << 16;
+                        memcpy(&drow[i], &u, 4);
+                    }
                 } else {
                     tr->to_float(srcrow, rowbuf.data(), nc);
                     memcpy(drow, rowbuf.data(), (size_t) nc * 4);
