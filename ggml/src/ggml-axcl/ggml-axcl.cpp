@@ -323,6 +323,9 @@ static std::string axcl_matmul_model_path(int64_t k, int64_t n) {
     return path;
 }
 
+// the AXCL engine IO is not thread-safe: serialize loads and executes
+static std::mutex axcl_exec_mutex;
+
 static axcl_matmul * axcl_matmul_load(int64_t k, int64_t n) {
     if (!axcl_engine_global_init()) {
         return nullptr;
@@ -449,9 +452,6 @@ static void axcl_dequant_any_to_f32_transposed(const struct ggml_tensor * t, flo
         }
     }
 }
-
-// the AXCL engine IO is not thread-safe: serialize loads and executes
-static std::mutex axcl_exec_mutex;
 
 static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor * src0,
                                       const struct ggml_tensor * src1, struct ggml_tensor * dst) {
