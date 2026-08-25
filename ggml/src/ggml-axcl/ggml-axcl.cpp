@@ -275,7 +275,12 @@ struct axcl_matmul {
     void * dx = nullptr;                 // f32 [K]
     void * dw = nullptr;                 // f32 [K, N] (transposed weights)
     void * dy = nullptr;                 // f32 [N]
-    std::vector<float> x_h, w_h, y_h;    // host staging
+    std::vector<float> x_h, y_h;        // host staging (per-call)
+    // upload-once weight staging: many weight tensors share one engine shape
+    // (every layer's k_proj is the same (k,n)) so device buffers are keyed
+    // by the weight tensor's data pointer, not the engine
+    std::unordered_map<const void *, void *> dev_w;
+    std::vector<float>                    w_h; // scratch for the one upload
 };
 
 static void axcl_preload_all_engines();
@@ -500,7 +505,6 @@ static void axcl_dequant_any_to_f32_transposed(const struct ggml_tensor * t, flo
 static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor * src0,
                                       const struct ggml_tensor * src1, struct ggml_tensor * dst) {
     std::lock_guard<std::mutex> exec_lock(axcl_exec_mutex);
-    fprintf(stderr, "[axcl-dbg] compute k=%lld n=%lld\n", (long long) mm->k, (long long) mm->n);
     const int64_t k = mm->k;
     const int64_t n = mm->n;
 
@@ -529,7 +533,6 @@ static bool ggml_axcl_compute_mul_mat(axcl_matmul * mm, const struct ggml_tensor
     }
 
     axclError ex = axclrtEngineExecute(mm->model_id, mm->context_id, 0, mm->io);
-    fprintf(stderr, "[axcl-dbg]  stg6 d2h\n");
     if (ex != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: engine execute failed\n");
         return false;
