@@ -1070,18 +1070,18 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             break;
         }
         case GGML_OP_DIAG_MASK_INF: {
-            float n_past_f;
-            memcpy(&n_past_f, node->op_params, sizeof(float));
-            const int64_t np = (int64_t)n_past_f;
+            // in-place on attention scores: set positions >= n_past to -inf
+            // op_params layout varies by version; read first 4 bytes as int
+            int32_t n_past = 0;
+            if (node->op_params) memcpy(&n_past, node->op_params, sizeof(int32_t));
+            if (n_past < 0) n_past = 0;
             const int64_t nc = node->ne[0];
             const int64_t nr = ggml_nrows(node);
             for (int64_t r = 0; r < nr; r++) {
                 float * dr = (float *)((char *)node->data + axcl_row_off(node, r));
-                if (src0 && src0->data != node->data) {
-                    const float * x = (const float *)((char *)src0->data + axcl_row_off(src0, r));
-                    memcpy(dr, x, (size_t)nc * 4);
+                for (int64_t i = n_past; i < nc && i < (int64_t)(ggml_nbytes(node)/4); i++) {
+                    dr[i] = -INFINITY;
                 }
-                for (int64_t i = np; i < nc; i++) dr[i] = -INFINITY;
             }
             break;
         }
@@ -1549,8 +1549,6 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
         case GGML_OP_ROPE:
         case GGML_OP_SET_ROWS:
         case GGML_OP_DIAG_MASK_INF:
-            // accepting these keeps the attention block in our splits
-            // (scheduler groups attention with rope/kv-write ops)
             return true;
         default:
             break;
