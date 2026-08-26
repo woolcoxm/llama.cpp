@@ -1566,13 +1566,18 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
                                    kt->type, vt->type, seq_total, HKV, &dk, &dv)) return false;
 
             const int base = seq_total - nq; // first cache slot of this ubatch
+            // ggml FA params: {float scale; float max_bias; ...} — apply the
+            // softmax scale to Q (engine computes softmax(qk + mask) raw)
+            float fa_scale = 1.0f;
+            memcpy(&fa_scale, node->op_params, sizeof(float));
+            if (fa_scale == 0.0f) fa_scale = 1.0f;
             static float eq[16 * 128];
             const size_t kv_bytes = (size_t)HQ * g_attn.t * D * 4;
             for (int tq_i = 0; tq_i < nq; tq_i++) {
                 const int seq_t = base + tq_i + 1; // causal: token sees [0, base+tq_i]
                 for (int h = 0; h < HQ; h++)
                     for (int d = 0; d < D; d++)
-                        eq[h * D + d] = *(const float *)((const char *)qt->data +
+                        eq[h * D + d] = fa_scale * *(const float *)((const char *)qt->data +
                             (size_t)tq_i * qt->nb[1] + (size_t)d * qt->nb[0] + (size_t)h * qt->nb[2]);
                 for (int t = 0; t < g_attn.t; t++) g_attn.m_buf[t] = (t < seq_t) ? 0.0f : -1e9f;
                 axclrtMemcpy(g_attn.dq, eq, (size_t)HQ * D * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
