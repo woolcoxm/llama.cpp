@@ -84,7 +84,8 @@ jobs:
             -DGGML_SANITIZE_UNDEFINED=${{ matrix.sanitizer == 'UNDEFINED' }} \
             -DLLAMA_SANITIZE_ADDRESS=${{ matrix.sanitizer == 'ADDRESS' }} \
             -DLLAMA_SANITIZE_THREAD=${{ matrix.sanitizer == 'THREAD' }} \
-            -DLLAMA_SANITIZE_UNDEFINED=${{ matrix.sanitizer == 'UNDEFINED' }}
+            -DLLAMA_SANITIZE_UNDEFINED=${{ matrix.sanitizer == 'UNDEFINED' }} \
+            -DLLAMA_BUILD_UI=ON
           cmake --build build --config ${{ matrix.build_type }} -j $(nproc) --target llama-server
 
       - name: Python setup
