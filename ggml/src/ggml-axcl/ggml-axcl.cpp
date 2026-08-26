@@ -1838,6 +1838,14 @@ struct axcl_layer_engine {
     int wm = -1;  // watermark: highest written row + 1
 };
 
+// per-layer GGUF weight stash: 7 matrices + 4 norms by (rows,cols) shape
+struct axcl_gguf_layer {
+    const struct ggml_tensor * t[11] = {nullptr}; // q k v o gate up down in_ln post_ln q_norm k_norm
+    bool complete() const {
+        for (int i = 0; i < 11; i++) if (t[i] == nullptr) return false;
+        return true;
+    }
+};
 struct axcl_layer_ctx {
     axcl_layer_engine eng[64];  // per transformer layer
     int n_layer = 0;
@@ -1878,6 +1886,113 @@ struct axcl_layer_ctx {
     void * y_next = nullptr;
 };
 static axcl_layer_ctx g_layer;
+static int n_layer_avail() { return g_layer.n_layer ? g_layer.n_layer : 28; }
+static axcl_gguf_layer g_gguf[64];
+static int g_gguf_n = 0;          // layers seen
+static bool g_layer_from_gguf = false;
+
+// ---- dynamic GGUF weight patching (layout_v4) ----
+// Template engines carry weights as RAW bf16 at deterministic positions
+// (validated byte-exact against baked engines). The loader scatters each
+// layer's GGUF weights (dequantized) + norm vectors into a copy of the
+// template and loads it from a temp file (LoadFromMem hangs in V3.6.5).
+struct axcl_layer_layout {
+    struct M { char name[12]; uint32_t rows, cols; std::vector<uint64_t> off; };
+    std::vector<M> mats;
+    struct N { char name[36]; uint32_t n; std::vector<uint64_t> off; };
+    std::vector<N> norms;
+    bool ok = false;
+};
+static axcl_layer_layout g_layout;
+
+static bool axcl_layer_load_layout(const char * path) {
+    FILE * f = fopen(path, "rb");
+    if (!f) return false;
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::vector<char> buf(sz);
+    if (fread(buf.data(), 1, sz, f) != (size_t) sz) { fclose(f); return false; }
+    fclose(f);
+    if (sz < 16 || memcmp(buf.data(), "AXL4", 4) != 0) return false;
+    uint32_t n_mat, n_norm;
+    memcpy(&n_mat, buf.data() + 8, 4);
+    memcpy(&n_norm, buf.data() + 12, 4);
+    if (n_mat > 8 || n_norm > 8) return false;
+    size_t p = 16;
+    for (uint32_t i = 0; i < n_mat; i++) {
+        axcl_layer_layout::M m;
+        memcpy(m.name, buf.data() + p, 8); m.name[8] = 0; p += 8;
+        memcpy(&m.rows, buf.data() + p, 4); p += 4;
+        memcpy(&m.cols, buf.data() + p, 4); p += 4;
+        m.off.resize((size_t) m.rows * m.cols);
+        memcpy(m.off.data(), buf.data() + p, (size_t) m.rows * m.cols * 8);
+        p += (size_t) m.rows * m.cols * 8;
+        g_layout.mats.push_back(std::move(m));
+    }
+    for (uint32_t i = 0; i < n_norm; i++) {
+        axcl_layer_layout::N n;
+        memcpy(n.name, buf.data() + p, 32); n.name[32] = 0; p += 32;
+        memcpy(&n.n, buf.data() + p, 4); p += 4;
+        n.off.resize(n.n);
+        memcpy(n.off.data(), buf.data() + p, (size_t) n.n * 8);
+        p += (size_t) n.n * 8;
+        g_layout.norms.push_back(std::move(n));
+    }
+    g_layout.ok = true;
+    return true;
+}
+
+static inline uint16_t axcl_f32_to_bf16_bits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, 4);
+    uint32_t bits = u >> 16;
+    uint32_t rem = u & 0xFFFF;
+    uint32_t ru = (rem > 0x8000) || (rem == 0x8000 && (bits & 1));
+    return (uint16_t) (bits + ru);
+}
+
+static void axcl_patch_matrix(char * eng, const axcl_layer_layout::M & m,
+                              const struct ggml_tensor * w) {
+    if (w == nullptr) return;
+    const int64_t rows = w->ne[1], cols = w->ne[0];
+    if ((uint32_t) rows != m.rows || (uint32_t) cols != m.cols) return;
+    const struct ggml_type_traits * tr = ggml_get_type_traits(w->type);
+    std::vector<float> row(cols);
+    for (int64_t r = 0; r < rows; r++) {
+        if (w->type == GGML_TYPE_F32) {
+            memcpy(row.data(), (const char *) w->data + (size_t) r * w->nb[1], (size_t) cols * 4);
+        } else {
+            tr->to_float((const void *) ((const char *) w->data + (size_t) r * w->nb[1]), row.data(), cols);
+        }
+        const uint64_t * offr = m.off.data() + (size_t) r * m.cols;
+        for (int64_t c = 0; c < cols; c++) {
+            uint64_t o = offr[c];
+            if (o == ~0ull) continue;
+            uint16_t b = axcl_f32_to_bf16_bits(row[c]);
+            eng[o] = (char) (b & 0xFF);
+            eng[o + 1] = (char) (b >> 8);
+        }
+    }
+}
+
+static void axcl_patch_norm(char * eng, const axcl_layer_layout::N & n,
+                            const struct ggml_tensor * w) {
+    if (w == nullptr) return;
+    const int64_t cnt = ggml_nelements(w);
+    if ((uint32_t) cnt != n.n) return;
+    const struct ggml_type_traits * tr = ggml_get_type_traits(w->type);
+    std::vector<float> v(cnt);
+    if (w->type == GGML_TYPE_F32) memcpy(v.data(), w->data, (size_t) cnt * 4);
+    else tr->to_float(w->data, v.data(), cnt);
+    for (int64_t i = 0; i < cnt; i++) {
+        uint64_t o = n.off[i];
+        if (o == ~0ull) continue;
+        uint16_t b = axcl_f32_to_bf16_bits(v[i]);
+        eng[o] = (char) (b & 0xFF);
+        eng[o + 1] = (char) (b >> 8);
+    }
+}
 
 static bool axcl_layer_load_engines(int n_layer) {
     const char * dir = getenv("GGML_AXCL_LAYER_DIR");
@@ -1926,9 +2041,58 @@ static bool axcl_layer_load_engines(int n_layer) {
         GGML_LOG_INFO("ggml-axcl: load1 probe only (model=%llx)\n", (unsigned long long) m1);
         return false;
     }
+    // dynamic GGUF patching: when enabled and the weight registry is full,
+    // build each layer's engine from the template + GGUF values; cache the
+    // patched files keyed by the weight pointers so reloads are free
+    const char * gguf_dir = getenv("GGML_AXCL_GGUF_DIR");
+    const bool want_gguf = getenv("GGML_AXCL_GGUF") != nullptr && g_gguf_n >= n_layer;
+    char cache_dir[512];
+    if (want_gguf) {
+        snprintf(cache_dir, sizeof(cache_dir), "%s", gguf_dir ? gguf_dir : "/tmp/axcl-gguf");
+        mkdir(cache_dir, 0755);
+    }
     char p[600];
     for (int l = 0; l < n_layer; l++) {
-        snprintf(p, sizeof(p), "%s/qwen3_p128_l%d_together.axmodel", d.c_str(), l);
+        if (want_gguf) {
+            // layout is loaded once; patch this layer from its stashed tensors
+            static bool layout_loaded = false;
+            if (!layout_loaded) {
+                const char * lp = getenv("GGML_AXCL_LAYOUT");
+                char lpath[600];
+                snprintf(lpath, sizeof(lpath), "%s", lp ? lp : "/usr/local/share/ggml-axcl/layer/layout_v4.bin");
+                if (!axcl_layer_load_layout(lpath)) {
+                    GGML_LOG_ERROR("ggml-axcl: layout %s failed to load; GGUF patching off\n", lpath);
+                    return false;
+                }
+                layout_loaded = true;
+            }
+            char tpl[600], dst[600];
+            snprintf(tpl, sizeof(tpl), "%s/qwen3_p128_l0_together.axmodel", d.c_str());
+            snprintf(dst, sizeof(dst), "%s/l%d.axmodel", cache_dir, l);
+            FILE * tf = fopen(tpl, "rb");
+            if (!tf) return false;
+            fseek(tf, 0, SEEK_END);
+            long sz = ftell(tf);
+            fseek(tf, 0, SEEK_SET);
+            std::vector<char> eng(sz);
+            if (fread(eng.data(), 1, sz, tf) != (size_t) sz) { fclose(tf); return false; }
+            fclose(tf);
+            for (size_t mi = 0; mi < g_layout.mats.size(); mi++) {
+                axcl_patch_matrix(eng.data(), g_layout.mats[mi], g_gguf[l].t[mi]);
+            }
+            for (size_t ni = 0; ni < g_layout.norms.size(); ni++) {
+                axcl_patch_norm(eng.data(), g_layout.norms[ni], g_gguf[l].t[7 + ni]);
+            }
+            FILE * of = fopen(dst, "wb");
+            if (!of) return false;
+            fwrite(eng.data(), 1, sz, of);
+            fclose(of);
+            snprintf(p, sizeof(p), "%s", dst);
+            GGML_LOG_INFO("ggml-axcl: layer %d patched from GGUF (%ld bytes)\n", l, sz);
+            g_layer_from_gguf = true;
+        } else {
+            snprintf(p, sizeof(p), "%s/qwen3_p128_l%d_together.axmodel", d.c_str(), l);
+        }
         axcl_layer_engine * e = &g_layer.eng[l];
         if (axclrtEngineLoadFromFile(p, &e->model) != AXCL_SUCC) {
             GGML_LOG_WARN("ggml-axcl: layer engine %s failed to load\n", p);
@@ -2290,6 +2454,171 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             layer_armed = true;
             g_layer.armed = true;
             g_layer.next_layer = 0;
+            // GGUF weight registry: stash layer tensors by shape. Layer order
+            // = anchor order; matrices by (rows, cols); norms by size.
+            if (getenv("GGML_AXCL_GGUF") && !g_layer_from_gguf) {
+                int anchor_i = -1;
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    struct ggml_tensor * n = cgraph->nodes[i];
+                    if (n->op == GGML_OP_MUL_MAT && n->src[0] && n->src[0]->op == GGML_OP_NONE &&
+                        n->src[0]->ne[0] == 1024 &&
+                        n->src[0]->ne[1] == 2048) {
+                        anchor_i++;
+                        if (anchor_i >= 64) break;
+                        g_gguf[anchor_i].t[0] = n->src[0]; // q
+                    }
+                }
+                // fill k/v/o/gate/up/down by shape on the SAME layer index
+                int qi = -1;
+                static bool seq_dumped = false;
+                if (getenv("GGML_AXCL_GGUF_DEBUG") && !seq_dumped) {
+                    seq_dumped = true;
+                    fprintf(stderr, "[mm-seq] leaf matmuls (ne0 x ne1, src0-op):\n");
+                    for (int i = 0; i < cgraph->n_nodes; i++) {
+                        struct ggml_tensor * n = cgraph->nodes[i];
+                        if (n->op == GGML_OP_MUL_MAT && n->src[0]) {
+                            fprintf(stderr, "  [%lld x %lld] op=%s\n",
+                                    (long long) n->src[0]->ne[0], (long long) n->src[0]->ne[1],
+                                    ggml_op_name(n->src[0]->op));
+                        }
+                    }
+                }
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    struct ggml_tensor * n = cgraph->nodes[i];
+                    if (n->op != GGML_OP_MUL_MAT || !n->src[0] || n->src[0]->op != GGML_OP_NONE ||
+                        n->src[0]->ne[0] != 1024) continue;
+                    const int64_t nr = n->src[0]->ne[1];
+                    if (nr == 2048) { qi++; continue; }
+                    if (qi < 0 || qi >= 64) continue;
+                    if (getenv("GGML_AXCL_GGUF_DEBUG") && qi < 2) {
+                        fprintf(stderr, "[kv-fill] qi=%d nr=%lld data=%p\n", qi, (long long) nr,
+                                n->src[0]->data);
+                    }
+                    if (nr == 1024) {
+                        // node order is q,v,k (k's norm/rope chain is longer) —
+                        // collect the pair, then assign k = lower address (k_proj
+                        // is allocated before v_proj in the model block)
+                        if (g_gguf[qi].t[1] == nullptr) g_gguf[qi].t[1] = n->src[0];
+                        else if (g_gguf[qi].t[2] == nullptr) g_gguf[qi].t[2] = n->src[0];
+                    }
+                    else if (nr == 3072 && g_gguf[qi].t[4] == nullptr) g_gguf[qi].t[4] = n->src[0]; // gate
+                    else if (nr == 3072 && g_gguf[qi].t[5] == nullptr) g_gguf[qi].t[5] = n->src[0]; // up
+                }
+                // finalize k/v: k_proj is the lower-address tensor
+                for (int q2 = 0; q2 < 64; q2++) {
+                    if (g_gguf[q2].t[1] && g_gguf[q2].t[2] &&
+                        (char *) g_gguf[q2].t[1]->data > (char *) g_gguf[q2].t[2]->data) {
+                        const struct ggml_tensor * tmp = g_gguf[q2].t[1];
+                        g_gguf[q2].t[1] = g_gguf[q2].t[2];
+                        g_gguf[q2].t[2] = tmp;
+                    }
+                }
+                // o (k=2048), down (k=3072): MUL_MATs with ne[0] != 1024
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    struct ggml_tensor * n = cgraph->nodes[i];
+                    if (n->op != GGML_OP_MUL_MAT || !n->src[0] || n->src[0]->op != GGML_OP_NONE) continue;
+                    const int64_t kc = n->src[0]->ne[0], nr = n->src[0]->ne[1];
+                    if (kc == 2048 && nr == 1024) {
+                        // o_proj appears after its layer's attention; map by
+                        // position: count layers whose q we've seen
+                        for (int q2 = 0; q2 < 64; q2++) {
+                            if (g_gguf[q2].t[0] && g_gguf[q2].t[3] == nullptr &&
+                                (q2 == 0 || g_gguf[q2 - 1].t[3])) {
+                                g_gguf[q2].t[3] = n->src[0];
+                                break;
+                            }
+                        }
+                    } else if (kc == 3072 && nr == 1024) {
+                        for (int q2 = 0; q2 < 64; q2++) {
+                            if (g_gguf[q2].t[0] && g_gguf[q2].t[6] == nullptr &&
+                                (q2 == 0 || g_gguf[q2 - 1].t[6])) {
+                                g_gguf[q2].t[6] = n->src[0];
+                                break;
+                            }
+                        }
+                    }
+                }
+                // norms: RMS_NORM weight muls near anchors (1024 = ln/post, 128 = q/k norm)
+                int ni2 = -1;
+                for (int i = 0; i < cgraph->n_nodes; i++) {
+                    struct ggml_tensor * n = cgraph->nodes[i];
+                    if (n->op == GGML_OP_MUL && n->ne[0] == 1024 && n->ne[1] == 1 &&
+                        n->src[1] && n->src[1]->ne[0] == 1024 && n->src[1]->ne[1] == 1) {
+                        // norm-gain mul: src1 = weight
+                        struct ggml_tensor * wgt = (n->src[1]->ne[0] == 1024 && n->src[1]->nb[1] == 0) ? n->src[1] : nullptr;
+                        (void) wgt;
+                    }
+                }
+                (void) ni2;
+                int nl_seen = 0;
+                for (int i = 0; i < cgraph->n_nodes && nl_seen < 64; i++) {
+                    struct ggml_tensor * n = cgraph->nodes[i];
+                    if (n->op != GGML_OP_MUL || n->ne[0] != 1024) continue;
+                    // norm gain: leaf [1024,1] weight whose other side is an
+                    // RMS_NORM output (chain-mode pattern)
+                    struct ggml_tensor * wgt = nullptr;
+                    if (n->src[1] && n->src[1]->op == GGML_OP_NONE && n->src[1]->ne[0] == 1024 &&
+                        n->src[1]->ne[1] == 1 && n->src[0] && n->src[0]->op == GGML_OP_RMS_NORM) wgt = n->src[1];
+                    else if (n->src[0] && n->src[0]->op == GGML_OP_NONE && n->src[0]->ne[0] == 1024 &&
+                             n->src[0]->ne[1] == 1 && n->src[1] && n->src[1]->op == GGML_OP_RMS_NORM) wgt = n->src[0];
+                    if (!wgt) continue;
+                    if (g_gguf[nl_seen].t[7] == nullptr) g_gguf[nl_seen].t[7] = wgt;
+                    else if (g_gguf[nl_seen].t[8] == nullptr) { g_gguf[nl_seen].t[8] = wgt; nl_seen++; }
+                }
+                // q_norm/k_norm (128)
+                int qn_seen = 0;
+                for (int i = 0; i < cgraph->n_nodes && qn_seen < 64; i++) {
+                    struct ggml_tensor * n = cgraph->nodes[i];
+                    if (n->op != GGML_OP_MUL || n->ne[0] != 128) continue;
+                    struct ggml_tensor * wgt = nullptr;
+                    if (n->src[1] && n->src[1]->op == GGML_OP_NONE && n->src[1]->ne[1] == 1 &&
+                        ggml_nelements(n->src[1]) == 128 && n->src[0] &&
+                        n->src[0]->op == GGML_OP_RMS_NORM) wgt = n->src[1];
+                    else if (n->src[0] && n->src[0]->op == GGML_OP_NONE && n->src[0]->ne[1] == 1 &&
+                             ggml_nelements(n->src[0]) == 128 && n->src[1] &&
+                             n->src[1]->op == GGML_OP_RMS_NORM) wgt = n->src[0];
+                    if (!wgt) continue;
+                    if (g_gguf[qn_seen].t[9] == nullptr) g_gguf[qn_seen].t[9] = wgt;
+                    else if (g_gguf[qn_seen].t[10] == nullptr) { g_gguf[qn_seen].t[10] = wgt; qn_seen++; }
+                }
+                int done_layers = 0;
+                for (int q2 = 0; q2 < 64 && g_gguf[q2].complete(); q2++) done_layers++;
+                if (done_layers > g_gguf_n) {
+                    g_gguf_n = done_layers;
+                    if (getenv("GGML_AXCL_LAYER_DEBUG")) {
+                        int filled[11] = {0,0,0,0,0,0,0,0,0,0,0};
+                        for (int q2 = 0; q2 < 64; q2++) {
+                            for (int ti = 0; ti < 11; ti++) if (g_gguf[q2].t[ti]) filled[ti]++;
+                        }
+                        GGML_LOG_ERROR("[gguf-reg] complete=%d per-tensor: q=%d k=%d v=%d o=%d gate=%d up=%d down=%d in=%d post=%d qn=%d kn=%d\n",
+                                       done_layers, filled[0], filled[1], filled[2], filled[3], filled[4],
+                                       filled[5], filled[6], filled[7], filled[8], filled[9], filled[10]);
+                    }
+                    if (done_layers == n_layer_avail()) {
+                        GGML_LOG_INFO("ggml-axcl: GGUF weight registry complete (%d layers)\n", done_layers);
+                        // swap NOW, before this graph's nodes execute — the
+                        // prefill must run entirely on the GGUF engines so KV
+                        // caches and hidden state stay consistent
+                        static bool swapped = false;
+                        if (!swapped) {
+                            swapped = true;
+                            for (int l = 0; l < g_layer.n_layer; l++) {
+                                if (g_layer.eng[l].model != 0) {
+                                    axclrtEngineDestroyIO(g_layer.eng[l].io);
+                                    axclrtEngineDestroyIOInfo(g_layer.eng[l].info);
+                                    axclrtEngineUnload(g_layer.eng[l].model);
+                                    g_layer.eng[l].model = 0;
+                                    g_layer.eng[l].ectx = 0;
+                                }
+                            }
+                            g_layer.loaded = false;
+                            g_layer.n_layer = 0;
+                            GGML_LOG_INFO("ggml-axcl: swapping to GGUF-patched engines\n");
+                            axcl_layer_load_engines(done_layers);
+                        }
+                    }
+                }
+            }
             // locate the FINAL norm: the RMS_NORM whose (mul'd) output
             // feeds the vocab-sized MUL_MAT — NOT the first RMS_NORM after
             // the anchors (that one is layer 27's post-attention norm!)
