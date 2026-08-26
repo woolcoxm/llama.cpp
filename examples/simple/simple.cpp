@@ -106,13 +106,19 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // an empty prompt still needs at least one token for decode
+    if (prompt_tokens.empty()) {
+        prompt_tokens.push_back(llama_token_bos(vocab));
+    }
+
     // initialize the context
 
     llama_context_params ctx_params = llama_context_default_params();
     // n_ctx is the context size
     ctx_params.n_ctx = n_prompt + n_predict - 1;
     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
-    ctx_params.n_batch = n_prompt;
+    ctx_params.n_batch = std::max(n_prompt, 1);
+    ctx_params.n_ctx   = std::max(n_prompt + n_predict - 1, 32);
     // enable performance counters
     ctx_params.no_perf = false;
 

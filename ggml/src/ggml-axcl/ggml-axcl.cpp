@@ -1692,23 +1692,20 @@ static struct ggml_tensor * attn_k_buf = nullptr;
 static struct ggml_tensor * xqkv_q[3] = {nullptr, nullptr, nullptr};
 static const void * xqkv_src1 = nullptr; // shared src1 of the projections
 static int xqkv_count = 0;
+static float xqkv_h[1024];               // X snapshot at stash time
+static uint64_t xqkv_reuse_hits = 0;
 
 static bool axcl_qkv_try_flush() {
     bool ok = false;
     if (xqkv_count == 3 && g_qkv.model != 0) {
         // h = the shared src1 (already normed by the host-side RMS_NORM)
-        struct ggml_tensor * h = xqkv_q[0]->src[1];
-        float h_buf[1024];
-        if (h->type == GGML_TYPE_F32) memcpy(h_buf, h->data, 1024*4);
-        else {
-            const auto * tr = ggml_get_type_traits(h->type);
-            if (tr && tr->to_float) tr->to_float(h->data, h_buf, 1024);
-            else { xqkv_count = 0; xqkv_src1 = nullptr; xqkv_q[0] = xqkv_q[1] = xqkv_q[2] = nullptr; return false; }
-        }
-        axclrtMemcpy(g_qkv.dev_in[0], h_buf, 1024*4, AXCL_MEMCPY_HOST_TO_DEVICE);
+        axclrtMemcpy(g_qkv.dev_in[0], xqkv_h, 1024*4, AXCL_MEMCPY_HOST_TO_DEVICE);
+        static const bool qkv_swap = getenv("GGML_AXCL_QKV_SWAP") != nullptr;
+        struct ggml_tensor * kt = qkv_swap ? xqkv_q[2] : xqkv_q[1];
+        struct ggml_tensor * vt = qkv_swap ? xqkv_q[1] : xqkv_q[2];
         void * dqw = axcl_fused_stage_w(&g_qkv, xqkv_q[0]->src[0], (size_t)1024*2048*4);
-        void * dkw = axcl_fused_stage_w(&g_qkv, xqkv_q[1]->src[0], (size_t)1024*1024*4);
-        void * dvw = axcl_fused_stage_w(&g_qkv, xqkv_q[2]->src[0], (size_t)1024*1024*4);
+        void * dkw = axcl_fused_stage_w(&g_qkv, kt->src[0], (size_t)1024*1024*4);
+        void * dvw = axcl_fused_stage_w(&g_qkv, vt->src[0], (size_t)1024*1024*4);
         if (dqw && dkw && dvw) {
             // pre-bound IO per layer: weights + outputs bound once at
             // creation; only the activation input is rebound per call
@@ -1725,8 +1722,8 @@ static bool axcl_qkv_try_flush() {
             axclrtEngineSetInputBufferByIndex(io, 0, g_qkv.dev_in[0], 1024*4);
             if (axclrtEngineExecute(g_qkv.model, g_qkv.ectx, 0, io) == AXCL_SUCC) {
                 axclrtMemcpy(xqkv_q[0]->data, g_qkv.dev_out[0], 2048*4, AXCL_MEMCPY_DEVICE_TO_HOST);
-                axclrtMemcpy(xqkv_q[1]->data, g_qkv.dev_out[1], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
-                axclrtMemcpy(xqkv_q[2]->data, g_qkv.dev_out[2], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
+                axclrtMemcpy(kt->data, g_qkv.dev_out[1], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
+                axclrtMemcpy(vt->data, g_qkv.dev_out[2], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
                 ok = true;
             }
         }
@@ -1757,44 +1754,65 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
             continue; // metadata-only: data pointer already correct
         }
-        // cross-split QKV fusion: q/k/v are three consecutive MUL_MATs
         // sharing src1. Executed at the FIRST node — computing late (at the
         // v node) violates the allocator's lifetime assumptions and corrupts
         // downstream reads via reused chunks.
         // fused rmsnorm+qkv: intercept the q_proj whose src1 is a norm node —
         // one engine call replaces the norm engine + qkv fusion
+        // cross-fragment QKV fusion: the scheduler emits q/k/v projections
+        // in SEPARATE fragments (CPU view ops between). Stash q and k
+        // uncomputed; at the v fragment run the fused engine once and write
+        // all three outputs. Scheduler order guarantees q/k outputs are
+        // consumed (rope) only after the v fragment.
+        // NOTE: default-off. The scheduler interleaves CPU fragments (q_norm,
+        // rope) between the q/k/v projection fragments — those read q/k
+        // outputs before this fusion's v-fragment writeback, corrupting the
+        // KV cache. Enable only with a scheduler that guarantees ordering.
         if (node->op == GGML_OP_MUL_MAT && g_qkv.model != 0 &&
-            node->src[1]->ne[1] == 1 && getenv("GGML_AXCL_NO_FUSION") == nullptr &&
-            node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 2048) {
-            // window scan: the graph interleaves q's norm/rope between the
-            // projections; executing the engine at the q node stays in
-            // topological order for all consumers
-            struct ggml_tensor * n1 = nullptr, * n2 = nullptr;
-            int i1 = -1, i2 = -1;
-            for (int w = i + 1; w < cgraph->n_nodes && w < i + 8; w++) {
-                struct ggml_tensor * cand = cgraph->nodes[w];
-                if (cand->op == GGML_OP_MUL_MAT && cand->src[1] == node->src[1] &&
-                    cand->src[0]->ne[0] == 1024 && cand->src[0]->ne[1] == 1024 &&
-                    !done.count(w)) {
-                    if (n1 == nullptr) { n1 = cand; i1 = w; }
-                    else               { n2 = cand; i2 = w; break; }
+            node->src[1]->ne[1] == 1 &&
+            getenv("GGML_AXCL_QKV_X") != nullptr) {
+            const bool is_q = node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 2048;
+            const bool is_kv = node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 1024;
+            const void * xs = node->src[1]->data;
+            if (is_q) {
+                if (xqkv_q[0] != nullptr) { xqkv_q[0] = xqkv_q[1] = xqkv_q[2] = nullptr; }
+                xqkv_q[0] = node; xqkv_src1 = xs; xqkv_count = 1;
+                // snapshot the activation NOW: the buffer may be reused by
+                // CPU ops in the fragments between q and v
+                {
+                    const struct ggml_tensor * h = node->src[1];
+                    if (h->type == GGML_TYPE_F32) memcpy(xqkv_h, h->data, sizeof(xqkv_h));
+                    else {
+                        const auto * tr = ggml_get_type_traits(h->type);
+                        if (!tr || !tr->to_float) { xqkv_count = 0; goto qkv_done; }
+                        tr->to_float(h->data, xqkv_h, 1024);
+                    }
+                }
+                continue; // deferred: computed by the fused engine at v
+            }
+            if (is_kv && xqkv_q[0] != nullptr && xqkv_src1 == xs && xqkv_q[0]->src[1]->data == xs) {
+                if (xqkv_count == 1) {
+                    xqkv_q[1] = node; xqkv_count = 2;
+                    continue; // deferred
+                } else if (xqkv_count == 2 && xqkv_q[1]->src[1]->data == xs) {
+                    xqkv_q[2] = node; xqkv_count = 3;
+                    uint64_t tt_q = axcl_us();
+                    const bool ok = axcl_qkv_try_flush();
+                    prof_t_qkv += axcl_us() - tt_q; prof_n_qkv++;
+                    if (ok) continue;
+                    // engine failed: outputs unwritten -> fall through to
+                    // compute this v normally (q/k lost: NOT recoverable;
+                    // abort loud rather than emit garbage)
+                    GGML_LOG_ERROR("ggml-axcl: cross-fragment QKV engine failed\n");
+                    return GGML_STATUS_ABORTED;
                 }
             }
-            if (n2 != nullptr) {
-                xqkv_q[0] = node; xqkv_q[1] = n1; xqkv_q[2] = n2; xqkv_count = 3;
-                uint64_t tt_q = axcl_us();
-                const bool ok = axcl_qkv_try_flush();
-                prof_t_qkv += axcl_us() - tt_q; prof_n_qkv++;
-                if (ok) {
-                    done.insert(i1); done.insert(i2);
-                    // no map inserts: q/k/v consumers (rope, set_rows) read
-                    // the host writebacks; lingering entries get consumed by
-                    // whichever tensor galloc assigns the same host address
-                    continue;
-                }
-                // engine unavailable: fall through, compute nodes individually
+            // unrelated [1024,1020] matmul while stashing: reset defensively
+            if (xqkv_q[0] != nullptr && !is_kv) {
+                xqkv_q[0] = xqkv_q[1] = xqkv_q[2] = nullptr; xqkv_count = 0;
             }
         }
+        qkv_done: ;
         // gate+up fusion: two consecutive MUL_MATs sharing src1 — executed
         // here in the main loop so the normed hidden is already computed
         if (node->op == GGML_OP_MUL_MAT && g_gate_up.model != 0 && i + 1 < cgraph->n_nodes &&
