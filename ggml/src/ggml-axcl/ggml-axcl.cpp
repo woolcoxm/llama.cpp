@@ -2046,6 +2046,53 @@ static bool axcl_layer_load_engines(int n_layer) {
     // patched files keyed by the weight pointers so reloads are free
     const char * gguf_dir = getenv("GGML_AXCL_GGUF_DIR");
     const bool want_gguf = getenv("GGML_AXCL_GGUF") != nullptr && g_gguf_n >= n_layer;
+    // GGUF mode: skip loading template engines at init — the weight registry
+    // only fills during the first graph's prescan, and the engines loaded
+    // now would be swapped out (a full wasted 28-engine load cycle).
+    // Shared buffers + mask still get set up so the prescan can arm.
+    if (getenv("GGML_AXCL_GGUF") && g_gguf_n == 0 && n_layer <= 0) {
+        DIR * dp = opendir(d.c_str());
+        int cnt = 0;
+        if (dp) {
+            struct dirent * de;
+            while ((de = readdir(dp)) != nullptr) {
+                int l;
+                if (sscanf(de->d_name, "qwen3_p128_l%d_together.axmodel", &l) == 1) cnt++;
+            }
+            closedir(dp);
+        }
+        if (cnt > 0 && cnt <= 64) g_layer.n_layer = cnt;
+        const int T = 2048;
+        axclrtMalloc(&g_layer.dx_in, 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
+        axclrtMalloc(&g_layer.d_idx, 4, AXCL_MEM_MALLOC_HUGE_FIRST);
+        axclrtMalloc(&g_layer.d_mask, ((size_t) T * (((size_t) (T + 1) * 2 + 7) & ~(size_t) 7) + 4096),
+                     AXCL_MEM_MALLOC_HUGE_FIRST);
+        axclrtMalloc(&g_layer.d_mask_row, (((size_t) (T + 1) * 2 + 7) & ~(size_t) 7), AXCL_MEM_MALLOC_HUGE_FIRST);
+        axclrtMalloc(&g_layer.d_kout, 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
+        axclrtMalloc(&g_layer.d_vout, 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
+        axclrtMalloc(&g_layer.d_yout, 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
+        axclrtMalloc(&g_layer.d_yout_alt, 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
+        {
+            const size_t rowb = ((size_t) (T + 1) * 2 + 7) & ~(size_t) 7;
+            std::vector<char> m((size_t) T * rowb, 0);
+            for (int p = 0; p < T; p++) {
+                for (int t = 0; t <= T; t++) {
+                    const bool allow = (t < p) || (t == T);
+                    float v = allow ? 0.0f : -1e9f;
+                    uint32_t u;
+                    memcpy(&u, &v, 4);
+                    uint16_t b = (uint16_t) (u >> 16);
+                    memcpy(&m[(size_t) p * rowb + (size_t) t * 2], &b, 2);
+                }
+            }
+            axclrtMemcpy(g_layer.d_mask, m.data(), m.size(), AXCL_MEMCPY_HOST_TO_DEVICE);
+            g_layer.mask_row_bytes = rowb;
+        }
+        g_layer.ctx_len = T;
+        g_layer.loaded = true;
+        GGML_LOG_INFO("ggml-axcl: GGUF mode — templates deferred (%d layers)\n", g_layer.n_layer);
+        return true;
+    }
     char cache_dir[512];
     if (want_gguf) {
         snprintf(cache_dir, sizeof(cache_dir), "%s", gguf_dir ? gguf_dir : "/tmp/axcl-gguf");
@@ -2068,27 +2115,49 @@ static bool axcl_layer_load_engines(int n_layer) {
             }
             char tpl[600], dst[600];
             snprintf(tpl, sizeof(tpl), "%s/qwen3_p128_l0_together.axmodel", d.c_str());
-            snprintf(dst, sizeof(dst), "%s/l%d.axmodel", cache_dir, l);
-            FILE * tf = fopen(tpl, "rb");
-            if (!tf) return false;
-            fseek(tf, 0, SEEK_END);
-            long sz = ftell(tf);
-            fseek(tf, 0, SEEK_SET);
-            std::vector<char> eng(sz);
-            if (fread(eng.data(), 1, sz, tf) != (size_t) sz) { fclose(tf); return false; }
-            fclose(tf);
-            for (size_t mi = 0; mi < g_layout.mats.size(); mi++) {
-                axcl_patch_matrix(eng.data(), g_layout.mats[mi], g_gguf[l].t[mi]);
+            // cache key: FNV-1a over sampled bytes of each weight tensor —
+            // the same GGUF reuses patched engines across processes
+            uint64_t h = 1469598103934665603ull;
+            for (int ti = 0; ti < 11; ti++) {
+                const struct ggml_tensor * wt = g_gguf[l].t[ti];
+                if (wt == nullptr) continue;
+                size_t nb = ggml_nbytes(wt);
+                size_t step = nb / 512 ? nb / 512 : 1;
+                for (size_t o = 0; o < nb; o += step) {
+                    h ^= ((const unsigned char *) wt->data)[o];
+                    h *= 1099511628211ull;
+                }
             }
-            for (size_t ni = 0; ni < g_layout.norms.size(); ni++) {
-                axcl_patch_norm(eng.data(), g_layout.norms[ni], g_gguf[l].t[7 + ni]);
+            snprintf(dst, sizeof(dst), "%s/l%d_%016llx.axmodel", cache_dir, l,
+                     (unsigned long long) h);
+            FILE * probe = fopen(dst, "rb");
+            bool cache_hit = (probe != nullptr);
+            if (probe) fclose(probe);
+            FILE * tf = nullptr;
+            if (!cache_hit) tf = fopen(tpl, "rb");
+            if (!cache_hit) {
+                if (!tf) return false;
+                fseek(tf, 0, SEEK_END);
+                long sz = ftell(tf);
+                fseek(tf, 0, SEEK_SET);
+                std::vector<char> eng(sz);
+                if (fread(eng.data(), 1, sz, tf) != (size_t) sz) { fclose(tf); return false; }
+                fclose(tf);
+                for (size_t mi = 0; mi < g_layout.mats.size(); mi++) {
+                    axcl_patch_matrix(eng.data(), g_layout.mats[mi], g_gguf[l].t[mi]);
+                }
+                for (size_t ni = 0; ni < g_layout.norms.size(); ni++) {
+                    axcl_patch_norm(eng.data(), g_layout.norms[ni], g_gguf[l].t[7 + ni]);
+                }
+                FILE * of = fopen(dst, "wb");
+                if (!of) return false;
+                fwrite(eng.data(), 1, sz, of);
+                fclose(of);
+                GGML_LOG_INFO("ggml-axcl: layer %d patched from GGUF (%ld bytes)\n", l, sz);
+            } else {
+                GGML_LOG_INFO("ggml-axcl: layer %d cache hit\n", l);
             }
-            FILE * of = fopen(dst, "wb");
-            if (!of) return false;
-            fwrite(eng.data(), 1, sz, of);
-            fclose(of);
             snprintf(p, sizeof(p), "%s", dst);
-            GGML_LOG_INFO("ggml-axcl: layer %d patched from GGUF (%ld bytes)\n", l, sz);
             g_layer_from_gguf = true;
         } else {
             snprintf(p, sizeof(p), "%s/qwen3_p128_l%d_together.axmodel", d.c_str(), l);
