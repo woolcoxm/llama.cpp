@@ -1770,7 +1770,19 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         // downstream reads via reused chunks.
         // fused rmsnorm+qkv: intercept the q_proj whose src1 is a norm node —
         // one engine call replaces the norm engine + qkv fusion
-        // cross-fragment QKV fusion: the scheduler emits q/k/v projections
+        // FA arrives as a claimed op; dispatch it to the host-op engine
+        // handler directly (the generic host_op call below is nested under
+        // chain-mode gates that do not apply here)
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            uint64_t tt_a = axcl_us();
+            const bool aok = ggml_axcl_host_op(node);
+            prof_t_attn += axcl_us() - tt_a; prof_n_attn++;
+            if (aok) continue;
+            GGML_LOG_ERROR("ggml-axcl: claimed FLASH_ATTN_EXT not handled\n");
+            return GGML_STATUS_ABORTED;
+        }
+
+
         // in SEPARATE fragments (CPU view ops between). Stash q and k
         // uncomputed; at the v fragment run the fused engine once and write
         // all three outputs. Scheduler order guarantees q/k outputs are
