@@ -1202,9 +1202,12 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             for (int64_t r = 0; r < nr; r++) {
                 const float * xr = (const float *) ((char *) src0->data + axcl_row_off(src0, r));
                 float *       dr = (float *) ((char *) node->data + axcl_row_off(node, r));
+                // match CPU arithmetic exactly: double accumulation,
+                // float division for mean, float 1/sqrtf for scale
                 double ss = 0.0;
-                for (int64_t i = 0; i < ne0; i++) ss += (double) xr[i] * xr[i];
-                float rms = (float) (1.0 / sqrt(ss / ne0 + eps));
+                for (int64_t i = 0; i < ne0; i++) ss += (double)(xr[i] * xr[i]);
+                const float mean = (float)(ss / ne0);
+                const float rms = 1.0f / sqrtf(mean + eps);
                 if (src1 != nullptr) {
                     const float * w = (const float *) ((const char *) src1->data + axcl_row_off(src1, r));
                     for (int64_t i = 0; i < ne0; i++) dr[i] = xr[i] * rms * w[i];
@@ -1760,67 +1763,6 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         // downstream reads via reused chunks.
         // fused rmsnorm+qkv: intercept the q_proj whose src1 is a norm node —
         // one engine call replaces the norm engine + qkv fusion
-        if (node->op == GGML_OP_MUL_MAT && g_chain.qkvn.model != 0 &&
-            node->src[1]->ne[1] == 1 && getenv("GGML_AXCL_NO_FUSION") == nullptr &&
-            node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 2048 &&
-            node->src[1]->op == GGML_OP_MUL &&
-            node->src[1]->src[0] != nullptr && node->src[1]->src[0]->op == GGML_OP_RMS_NORM) {
-            // src1 = MUL(norm_out, w); h = the pre-norm hidden, w = gain
-            struct ggml_tensor * muln = node->src[1];
-            struct ggml_tensor * nrm = muln->src[0];
-            struct ggml_tensor * nrm_w = muln->src[1];
-            struct ggml_tensor * h = nrm->src[0];
-            // find k/v projections in the window (same src1 = the norm node)
-            struct ggml_tensor * n1 = nullptr, * n2 = nullptr;
-            int i1 = -1, i2 = -1;
-            for (int w = i + 1; w < cgraph->n_nodes && w < i + 8; w++) {
-                struct ggml_tensor * cand = cgraph->nodes[w];
-                if (cand->op == GGML_OP_MUL_MAT && cand->src[1] == muln &&
-                    cand->src[0]->ne[0] == 1024 && cand->src[0]->ne[1] == 1024 &&
-                    !done.count(w)) {
-                    if (n1 == nullptr) { n1 = cand; i1 = w; }
-                    else               { n2 = cand; i2 = w; break; }
-                }
-            }
-            if (n2 != nullptr) {
-                // run fused norm+qkv now (h is ready: topo order)
-                float h_buf[1024];
-                if (h->type == GGML_TYPE_F32) memcpy(h_buf, h->data, 1024*4);
-                else {
-                    const auto * tr = ggml_get_type_traits(h->type);
-                    if (!tr || !tr->to_float) { /* fall through to old path */ }
-                    else tr->to_float(h->data, h_buf, 1024);
-                }
-                void * dnw = nrm_w ? axcl_chain_stage_w(&g_chain.qkvn, nrm_w, 1024*4) : nullptr;
-                void * dqw = axcl_fused_stage_w(&g_chain.qkvn, node->src[0], (size_t)1024*2048*4);
-                void * dkw = axcl_fused_stage_w(&g_chain.qkvn, n1->src[0], (size_t)1024*1024*4);
-                void * dvw = axcl_fused_stage_w(&g_chain.qkvn, n2->src[0], (size_t)1024*1024*4);
-                if (dnw && dqw && dkw && dvw) {
-                    std::lock_guard<std::mutex> lock(axcl_exec_mutex);
-                    axclrtMemcpy(g_chain.qkvn.dev_in[0], h_buf, 1024*4, AXCL_MEMCPY_HOST_TO_DEVICE);
-                    axclrtEngineSetInputBufferByIndex(g_chain.qkvn.io, 0, g_chain.qkvn.dev_in[0], 1024*4);
-                    axclrtEngineSetInputBufferByIndex(g_chain.qkvn.io, 1, dnw, 1024*4);
-                    axclrtEngineSetInputBufferByIndex(g_chain.qkvn.io, 2, dqw, (size_t)1024*2048*4);
-                    axclrtEngineSetInputBufferByIndex(g_chain.qkvn.io, 3, dkw, (size_t)1024*1024*4);
-                    axclrtEngineSetInputBufferByIndex(g_chain.qkvn.io, 4, dvw, (size_t)1024*1024*4);
-                    axclrtEngineSetOutputBufferByIndex(g_chain.qkvn.io, 0, g_chain.qkvn.dev_out[0], 2048*4);
-                    axclrtEngineSetOutputBufferByIndex(g_chain.qkvn.io, 1, g_chain.qkvn.dev_out[1], 1024*4);
-                    axclrtEngineSetOutputBufferByIndex(g_chain.qkvn.io, 2, g_chain.qkvn.dev_out[2], 1024*4);
-                    if (axclrtEngineExecute(g_chain.qkvn.model, g_chain.qkvn.ectx, 0, g_chain.qkvn.io) == AXCL_SUCC) {
-                        g_dbg_qkvn++;
-                        axclrtMemcpy(node->data, g_chain.qkvn.dev_out[0], 2048*4, AXCL_MEMCPY_DEVICE_TO_HOST);
-                        axclrtMemcpy(n1->data, g_chain.qkvn.dev_out[1], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
-                        axclrtMemcpy(n2->data, g_chain.qkvn.dev_out[2], 1024*4, AXCL_MEMCPY_DEVICE_TO_HOST);
-                        // mark the norm node done if it is immediately before
-                        done.insert(i1); done.insert(i2);
-                        for (int w = i - 1; w >= 0 && i - w < 4; w--) {
-                            if (cgraph->nodes[w] == nrm || cgraph->nodes[w] == muln) { done.insert(w); }
-                        }
-                        continue;
-                    }
-                }
-            }
-        }
         if (node->op == GGML_OP_MUL_MAT && g_qkv.model != 0 &&
             node->src[1]->ne[1] == 1 && getenv("GGML_AXCL_NO_FUSION") == nullptr &&
             node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 2048) {
