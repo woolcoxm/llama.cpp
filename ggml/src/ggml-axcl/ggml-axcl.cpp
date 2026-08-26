@@ -2002,7 +2002,12 @@ static bool axcl_layer_load_engines(int n_layer) {
     // shared IO buffers
     const int T = g_layer.ctx_len;
     axclrtMalloc(&g_layer.dx_in, 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
-    axclrtMalloc(&g_layer.d_idx, 4, AXCL_MEM_MALLOC_HUGE_FIRST);
+    axclrtMalloc(&g_layer.d_idx, 2048 * 4 + 8, AXCL_MEM_MALLOC_HUGE_FIRST);
+    {
+        std::vector<uint32_t> idxs(2048);
+        for (int i = 0; i < 2048; i++) idxs[i] = (uint32_t) i;
+        axclrtMemcpy(g_layer.d_idx, idxs.data(), 2048 * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+    }
     axclrtMalloc(&g_layer.d_mask, ((size_t) T * (((size_t) (T + 1) * 2 + 7) & ~(size_t) 7) + 4096), AXCL_MEM_MALLOC_HUGE_FIRST);
     axclrtMalloc(&g_layer.d_mask_row, (((size_t) (T + 1) * 2 + 7) & ~(size_t) 7), AXCL_MEM_MALLOC_HUGE_FIRST);
     axclrtMalloc(&g_layer.d_kout, 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
@@ -2108,8 +2113,8 @@ static bool axcl_layer_run(int l, int pos,
     axclrtEngineSetInputBufferByIndex(e->io, e->iv, e->dv, kv_bytes);
     axclrtEngineSetInputBufferByIndex(e->io, e->ii, g_layer.d_idx, 4);
     axclrtEngineSetInputBufferByIndex(e->io, e->ix, g_layer.d_hidden, 1024 * 2);
-    // bind the mask at a dedicated buffer BASE and refresh its content per
-    // call — offset bindings into the table are not honored by the runtime
+    // sub-buffer (offset) bindings are mishandled by the runtime for both
+    // mask and indices — refresh a dedicated buffer's content per call
     axclrtMemcpy(g_layer.d_mask_row, (char *) g_layer.d_mask + (size_t) pos * g_layer.mask_row_bytes,
                  (size_t) (T + 1) * 2, AXCL_MEMCPY_DEVICE_TO_DEVICE);
     axclrtEngineSetInputBufferByIndex(e->io, e->im, g_layer.d_mask_row, (size_t) (T + 1) * 2);
