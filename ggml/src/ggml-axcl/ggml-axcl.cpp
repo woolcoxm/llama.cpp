@@ -3486,18 +3486,27 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
         // GGML_AXCL_NO_ENGINES=1: activate the device but skip all engine
         // loads — bisecting host-memory corruption during model load
         const bool no_engines = getenv("GGML_AXCL_NO_ENGINES") != nullptr;
-        if (!no_engines) {
+        // whole-layer mode replaces the ENTIRE legacy path (per-op matmul
+        // engines + 2.5GB weight pool + fused engines) — armed graphs never
+        // touch them. Skip ~3.4GB of CMM that would sit idle.
+        const bool layer_only = getenv("GGML_AXCL_LAYER") != nullptr ||
+                                getenv("GGML_AXCL_GGUF") != nullptr;
+        if (!no_engines && !layer_only) {
         axcl_preload_all_engines(); // outside the activation mutex
         axcl_weight_pool_init();
         axcl_attn_load();
         if (getenv("GGML_AXCL_CHAIN") != nullptr) {
             axcl_chain_load();
         }
-        if (getenv("GGML_AXCL_LAYER") != nullptr) {
+        }
+        // whole-layer engines load regardless of the legacy-skip above; in
+        // GGUF mode the loader defers to patched engines (see load_engines)
+        if (getenv("GGML_AXCL_LAYER") != nullptr || getenv("GGML_AXCL_GGUF") != nullptr) {
             axcl_layer_load_engines(-1); // layer count from template files
         }
+        if (!no_engines && !layer_only) {
         // QKV fused engine: rms_norm(hidden) -> q, k, v in one call
-        if (axcl_fused_load(&g_qkv, "/usr/local/share/ggml-axcl/qkv_nn_h1024_q2048_kv1024.axmodel",
+        if (!layer_only && axcl_fused_load(&g_qkv, "/usr/local/share/ggml-axcl/qkv_nn_h1024_q2048_kv1024.axmodel",
                             {"h", "q_w", "k_w", "v_w"}, {"q", "k", "v"})) {
             axcl_fused_alloc(&g_qkv,
                 {1024*4, (size_t)1024*2048*4, (size_t)1024*1024*4, (size_t)1024*1024*4},
@@ -3505,7 +3514,7 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
             GGML_LOG_INFO("ggml-axcl: QKV no-norm engine loaded\n");
         }
         // gate+up fused engine: h @ gate_w, h @ up_w in one call
-        if (axcl_fused_load(&g_gate_up, "/usr/local/share/ggml-axcl/gate_up_h1024_i3072.axmodel",
+        if (!layer_only && axcl_fused_load(&g_gate_up, "/usr/local/share/ggml-axcl/gate_up_h1024_i3072.axmodel",
                             {"h", "gate_w", "up_w"}, {"gate", "up"})) {
             axcl_fused_alloc(&g_gate_up,
                 {1024*4, (size_t)1024*3072*4, (size_t)1024*3072*4},
