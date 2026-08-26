@@ -1533,6 +1533,12 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             const struct ggml_tensor * qt = src0;
             const struct ggml_tensor * kt = src1;
             const struct ggml_tensor * vt = node->src[2];
+            { static int fn = 0; if (fn < 4) { fn++;
+              fprintf(stderr, "[fa-strides] Q ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu] | K ne=[%lld,%lld,%lld] nb=[%zu,%zu,%zu] ty=%d | V nb=[%zu,%zu,%zu] ty=%d | out nb=[%zu,%zu,%zu]\n",
+                (long long)qt->ne[0], (long long)qt->ne[1], (long long)qt->ne[2], qt->nb[0], qt->nb[1], qt->nb[2],
+                (long long)kt->ne[0], (long long)kt->ne[1], (long long)kt->ne[2], kt->nb[0], kt->nb[1], kt->nb[2], (int)kt->type,
+                vt->nb[0], vt->nb[1], vt->nb[2], (int)vt->type,
+                node->nb[0], node->nb[1], node->nb[2]); } }
             const int HQ = 16, D = 128, HKV = 8;
             if (qt->ne[0] != D || kt->ne[2] != HKV) return false; // wrong head config
             const int nq = (int) qt->ne[1];
@@ -2490,14 +2496,20 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
             case GGML_OP_CONT:
                 return false;
             case GGML_OP_FLASH_ATTN_EXT:
-                return false; // CPU flash-attn: engine output wrong on long
-                              // prompts; needs tensor-level diff debugging
+                // CPU flash-attn by default: the FA host-op's K stride
+                // handling is wrong for llama.cpp's interleaved-head cache
+                // layout (see [fa-strides] log). GGML_AXCL_FA=1 to claim
+                // and route to the attention engine while debugging.
+                return getenv("GGML_AXCL_FA") == nullptr;
             default:
                 return true;
         }
     }
     if (uni_env != nullptr) {
         return true;
+    }
+    if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+        return getenv("GGML_AXCL_FA") != nullptr;
     }
     return op->op == GGML_OP_MUL_MAT;
 }
