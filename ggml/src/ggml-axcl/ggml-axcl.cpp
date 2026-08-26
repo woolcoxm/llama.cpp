@@ -1881,12 +1881,47 @@ struct axcl_layer_ctx {
     int pos = -1, pos_last_pass = -1;
     struct ggml_tensor * final_norm = nullptr;
     struct ggml_tensor * out_add = nullptr;
+    void * post_hidden = nullptr;
     size_t mask_row_bytes = 0;
     void * d_mask_row = nullptr;
     void * y_next = nullptr;
 };
 static axcl_layer_ctx g_layer;
 static int n_layer_avail() { return g_layer.n_layer ? g_layer.n_layer : 28; }
+
+// post engine: final norm + lm_head on NPU (bf16 hidden in, bf16 logits out)
+struct axcl_post_engine {
+    uint64_t model = 0, ectx = 0;
+    axclrtEngineIOInfo info = nullptr;
+    axclrtEngineIO io = nullptr;
+    int ix = -1, iyo = -1;
+    void * dy = nullptr;             // logits [151936] bf16
+    bool ok = false;
+};
+static axcl_post_engine g_post;
+static bool g_layer_logits_on_npu = false; // set once the post engine runs
+
+static void axcl_post_load() {
+    if (g_post.ok || g_layer.n_layer == 0) return;
+    const char * env = getenv("GGML_AXCL_POST_MODEL");
+    char p[600];
+    snprintf(p, sizeof(p), "%s", env ? env : "/usr/local/share/ggml-axcl/layer/qwen3_post.axmodel");
+    FILE * f = fopen(p, "r");
+    if (!f) return;
+    fclose(f);
+    if (axclrtEngineLoadFromFile(p, &g_post.model) != AXCL_SUCC) return;
+    axclrtEngineGetIOInfo(g_post.model, &g_post.info);
+    axclrtEngineCreateIO(g_post.info, &g_post.io);
+    axclrtEngineCreateContext(g_post.model, &g_post.ectx);
+    g_post.ix = axclrtEngineGetInputIndexByName(g_post.info, "input");
+    g_post.iyo = axclrtEngineGetOutputIndexByName(g_post.info, "output");
+    if (g_post.ix < 0 || g_post.iyo < 0) { g_post.model = 0; return; }
+    axclrtMalloc(&g_post.dy, (size_t) 151936 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
+    g_post.ok = true;
+    GGML_LOG_INFO("ggml-axcl: post engine ready (NPU logits)\n");
+}
+
+
 static axcl_gguf_layer g_gguf[64];
 static int g_gguf_n = 0;          // layers seen
 static bool g_layer_from_gguf = false;
@@ -2913,6 +2948,9 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 // mul are in this fragment and compute via host ops from it;
                 // only the vocab matmul lives on the CPU side.
                 if (node == g_layer.out_add && node->op == GGML_OP_ADD) {
+                    // remember the device hidden (bf16) for the post engine
+                    axcl_post_load();
+                    g_layer.post_hidden = g_layer.d_hidden;
                     const int rows = (int) node->ne[1];
                     const int src_rows = std::max(1, g_layer.n_tok);
                     for (int t = 0; t < rows; t++) {
@@ -3174,6 +3212,34 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             bool hok = ggml_axcl_host_op(node);
             prof_t_host += axcl_us() - tt_h; prof_n_host++;
             if (hok) continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT && g_post.ok && node->src[0] &&
+            node->src[0]->ne[1] > 32768 && node->src[0]->ne[0] == 1024 &&
+            g_layer.post_hidden != nullptr) {
+            // vocab head via the post engine: input = the device-resident
+            // final hidden (no H2D), output = bf16 logits -> f32 dst
+            std::lock_guard<std::mutex> lock(axcl_exec_mutex);
+            axclrtEngineSetInputBufferByIndex(g_post.io, g_post.ix, g_layer.post_hidden, 1024 * 2);
+            axclrtEngineSetOutputBufferByIndex(g_post.io, g_post.iyo, g_post.dy, (size_t) 151936 * 2);
+            if (axclrtEngineExecute(g_post.model, g_post.ectx, 0, g_post.io) != AXCL_SUCC) {
+                GGML_LOG_ERROR("ggml-axcl: post engine execute failed\n");
+                return GGML_STATUS_ABORTED;
+            }
+            static std::vector<uint16_t> lbuf;
+            lbuf.resize(151936);
+            axclrtMemcpy(lbuf.data(), g_post.dy, (size_t) 151936 * 2, AXCL_MEMCPY_DEVICE_TO_HOST);
+            // llama.cpp samples from the LAST position's logits; for
+            // multi-token graphs write the row it reads
+            const int64_t mrows = node->ne[1];
+            float * dstf = (float *)((char *) node->data + (size_t)(mrows - 1) * node->nb[1]);
+            const int64_t nv = node->ne[0];
+            for (int64_t i = 0; i < nv && i < 151936; i++) {
+                uint32_t u = (uint32_t) lbuf[i] << 16;
+                memcpy(&dstf[i], &u, 4);
+            }
+            g_layer_logits_on_npu = true;
+            g_layer.post_hidden = nullptr;
+            continue;
         }
         if (node->op == GGML_OP_MUL_MAT) {
             struct ggml_tensor * src0 = node->src[0];
@@ -3503,6 +3569,7 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
         // GGUF mode the loader defers to patched engines (see load_engines)
         if (getenv("GGML_AXCL_LAYER") != nullptr || getenv("GGML_AXCL_GGUF") != nullptr) {
             axcl_layer_load_engines(-1); // layer count from template files
+            axcl_post_load();            // 170MB — load now, not mid-graph
         }
         if (!no_engines && !layer_only) {
         // QKV fused engine: rms_norm(hidden) -> q, k, v in one call
@@ -3662,6 +3729,11 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
     static const char * npu_vocab_env = getenv("GGML_AXCL_NPU_VOCAB");
     if (npu_vocab_env == nullptr && op->op == GGML_OP_MUL_MAT &&
         op->src[0] != nullptr && op->src[0]->ne[1] > 32768) {
+        // whole-layer mode claims the vocab head for the post engine (final
+        // norm + lm_head computed on the NPU; hidden stays device-resident)
+        if (getenv("GGML_AXCL_LAYER") || getenv("GGML_AXCL_GGUF")) {
+            return op->src[0]->ne[0] == 1024;
+        }
         return false;
     }
     static const char * uni_env = getenv("GGML_AXCL_UNIVERSAL");
