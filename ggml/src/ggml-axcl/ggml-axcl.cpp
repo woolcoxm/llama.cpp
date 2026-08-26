@@ -469,6 +469,11 @@ static void axcl_attn_load() {
     const char * env = getenv("AXCL_ATTN_MODEL");
     const char * path = env ? env : "/usr/local/share/ggml-axcl/attn_h16_d128_t32.axmodel";
     FILE * f = fopen(path, "r");
+    if (!f && !env) {
+        // prefer the largest installed context engine
+        path = "/usr/local/share/ggml-axcl/attn_h16_d128_t512.axmodel";
+        f = fopen(path, "r");
+    }
     if (!f) return;
     fclose(f);
     // engine context length from the filename (..._t512.axmodel); default 32
@@ -2031,13 +2036,13 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 if (g_attn.model != 0 && src0->ne[2] > 1 && src1->ne[1] == 1 &&
                     getenv("GGML_AXCL_NO_FUSION") == nullptr &&
                     (src0->ne[1] == 128 || src0->ne[0] == 128)) {
-                    if (src0->ne[1] == 128 && src0->ne[0] > 128) {
+                    if (src0->ne[1] == 128 && src0->ne[0] >= 1) {
                         // q@k: buffer Q (src1) and K cache (src0), skip computing
                         attn_q_buf = src1;
                         attn_k_buf = src0;
                         continue; // intermediates (scale/mask/softmax) run on garbage — harmless
                     }
-                    if (src0->ne[0] == 128 && src0->ne[1] > 128 &&
+                    if (src0->ne[0] == 128 && src0->ne[1] >= 1 &&
                         attn_q_buf != nullptr && attn_k_buf != nullptr) {
                         // @v: run the attention engine with buffered Q, K + this V.
                         // K/V stay device-resident; only new tokens are uploaded.
