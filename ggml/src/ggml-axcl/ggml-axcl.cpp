@@ -1888,7 +1888,9 @@ struct axcl_layer_engine {
     void * dk = nullptr, * dv = nullptr;
     int wm = -1;  // watermark: highest written row + 1
     bool bound = false; // static IO bindings (K/V/idx/mask) done once
-    axclrtEngineIO io_chunk = nullptr; // dedicated IO handle for prefill groups
+    axclrtEngineIO io_chunk[12] = {}; // dedicated IO handle PER shape group
+                                      // (shared handles mis-bind internals;
+                                      // discovered via phase_c harnesses)
 };
 
 // per-layer GGUF weight stash: 7 matrices + 4 norms by (rows,cols) shape
@@ -1961,6 +1963,9 @@ struct axcl_layer_ctx {
     void * d_chunk_out = nullptr; // [128,1024] bf16 chunk output staging
     void * d_idx_m     = nullptr; // [128] u32
     void * d_mask_m    = nullptr; // [128,1152] bf16 max
+    void * d_chunk_ko  = nullptr; // [128,1024] bf16 K rows out (dedicated —
+                                  // offset output binds mis-execute)
+    void * d_chunk_vo  = nullptr; // [128,1024] bf16 V rows out
     void * pin_idx_m   = nullptr; // [128] u32 pinned
     void * pin_mask_m  = nullptr; // [128,1152] bf16 pinned
     void * pin_chunk   = nullptr; // [128,1024] bf16 pinned (layer-0 H2D)
@@ -1979,11 +1984,58 @@ struct axcl_post_engine {
     axclrtEngineIOInfo info = nullptr;
     axclrtEngineIO io = nullptr;
     int ix = -1, iyo = -1;
-    void * dy = nullptr;             // logits [151936] bf16
+    void * dy = nullptr;             // logits [n_out] bf16
     bool ok = false;
+    // vocab-trimmed post: n_out < 151936 logits, expanded via trim_ids
+    int n_out = 151936;
+    int32_t * trim_ids = nullptr;    // trimmed position -> full token id
+    float * f32_scratch = nullptr;   // [n_out] converted logits
 };
 static axcl_post_engine g_post;
 static bool g_layer_logits_on_npu = false; // set once the post engine runs
+
+// multi-row vocab head (speculative verification): X [64,1024] f32 in,
+// Y [64,151936] f32 out — ONE call produces logits for up to 64 positions
+struct axcl_vocab64_engine {
+    uint64_t model = 0, ectx = 0;
+    axclrtEngineIOInfo info = nullptr;
+    axclrtEngineIO io = nullptr;
+    int ix = -1, iyo = -1;
+    void * dx = nullptr;            // [64,1024] f32
+    void * dy = nullptr;            // [64,151936] f32
+    float * pin_in = nullptr;       // pinned staging, 64*1024 f32
+    float * pin_out = nullptr;      // pinned, 64*151936 f32
+    bool ok = false;
+    bool tried = false;
+};
+static axcl_vocab64_engine g_v64;
+
+static void axcl_vocab64_load() {
+    if (g_v64.tried || g_v64.ok) return;
+    g_v64.tried = true;
+    const char * env = getenv("GGML_AXCL_VOCAB64");
+    if (!env) return;
+    if (axclrtEngineLoadFromFile(env, &g_v64.model) != AXCL_SUCC) {
+        GGML_LOG_WARN("ggml-axcl: vocab64 %s failed to load\n", env);
+        g_v64.model = 0;
+        return;
+    }
+    axclrtEngineGetIOInfo(g_v64.model, &g_v64.info);
+    axclrtEngineCreateIO(g_v64.info, &g_v64.io);
+    axclrtEngineCreateContext(g_v64.model, &g_v64.ectx);
+    g_v64.ix = axclrtEngineGetInputIndexByName(g_v64.info, "X");
+    g_v64.iyo = axclrtEngineGetOutputIndexByName(g_v64.info, "Y");
+    if (g_v64.ix < 0 || g_v64.iyo < 0) { g_v64.model = 0; return; }
+    if (axclrtMalloc(&g_v64.dx, 64 * 1024 * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+        axclrtMalloc(&g_v64.dy, (size_t) 64 * 151936 * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+        axclrtMallocHost((void **) &g_v64.pin_in, 64 * 1024 * 4) != AXCL_SUCC ||
+        axclrtMallocHost((void **) &g_v64.pin_out, (size_t) 64 * 151936 * 4) != AXCL_SUCC) {
+        g_v64.model = 0;
+        return;
+    }
+    g_v64.ok = true;
+    GGML_LOG_INFO("ggml-axcl: vocab64 verify head ready (64-row logits)\n");
+}
 
 static void axcl_post_load() {
     if (g_post.ok || g_layer.n_layer == 0) return;
@@ -2000,7 +2052,39 @@ static void axcl_post_load() {
     g_post.ix = axclrtEngineGetInputIndexByName(g_post.info, "input");
     g_post.iyo = axclrtEngineGetOutputIndexByName(g_post.info, "output");
     if (g_post.ix < 0 || g_post.iyo < 0) { g_post.model = 0; return; }
-    axclrtMalloc(&g_post.dy, (size_t) 151936 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
+    uint64_t out_sz = axclrtEngineGetOutputSizeByIndex(g_post.info, 0, (uint32_t) g_post.iyo);
+    if (out_sz > 4) g_post.n_out = (int) (out_sz / 2);   // bf16 logits
+    if (g_post.n_out != 151936) {
+        // vocab-trimmed post: load the kept-ids map (JSON int array)
+        const char * tenv = getenv("GGML_AXCL_POST_TRIM");
+        if (!tenv) {
+            GGML_LOG_ERROR("ggml-axcl: trimmed post (%d logits) needs GGML_AXCL_POST_TRIM\n", g_post.n_out);
+            g_post.model = 0; return;
+        }
+        FILE * tf = fopen(tenv, "r");
+        if (!tf) { GGML_LOG_ERROR("ggml-axcl: trim map %s unreadable\n", tenv); g_post.model = 0; return; }
+        char buf[1 << 20];
+        int len = (int) fread(buf, 1, sizeof(buf) - 1, tf);
+        fclose(tf);
+        buf[len] = 0;
+        g_post.trim_ids = (int32_t *) malloc((size_t) g_post.n_out * 4);
+        int n = 0; char * s = buf;
+        while (n < g_post.n_out && *s) {
+            while (*s && (*s == ',' || *s == ' ' || *s == '[' || *s == ']')) s++;
+            if (!*s) break;
+            char * s0 = s;
+            long v = strtol(s, &s, 10);
+            if (s == s0) break;
+            g_post.trim_ids[n++] = (int32_t) v;
+        }
+        g_post.f32_scratch = (float *) malloc((size_t) g_post.n_out * 4);
+        if (n != g_post.n_out) {
+            GGML_LOG_ERROR("ggml-axcl: trim map has %d ids, engine emits %d\n", n, g_post.n_out);
+            g_post.model = 0; return;
+        }
+        GGML_LOG_INFO("ggml-axcl: trimmed post (%d of 151936 vocab)\n", g_post.n_out);
+    }
+    axclrtMalloc(&g_post.dy, (size_t) g_post.n_out * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
     g_post.ok = true;
     GGML_LOG_INFO("ggml-axcl: post engine ready (NPU logits)\n");
 }
@@ -2651,16 +2735,23 @@ static bool axcl_layer_run_chunk(int l, int p, int ntok) {
             axclrtMalloc(&g_layer.d_chunk_out, 128 * 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
             axclrtMalloc(&g_layer.d_idx_m, 128 * 4, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
             axclrtMalloc(&g_layer.d_mask_m, (size_t) 128 * 1152 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            // K/V_out must land in DEDICATED buffers — binding outputs into
+            // cache rows at byte offsets silently mis-executes on this
+            // runtime (phase_c_refcheck: offset output binds are the reason
+            // the chunk ladder was ever believed broken)
+            axclrtMalloc(&g_layer.d_chunk_ko, 128 * 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            axclrtMalloc(&g_layer.d_chunk_vo, 128 * 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
             axclrtMallocHost(&g_layer.pin_idx_m, 128 * 4) != AXCL_SUCC ||
             axclrtMallocHost(&g_layer.pin_mask_m, (size_t) 128 * 1152 * 2) != AXCL_SUCC) {
             g_layer.n_groups = 1; // batched prefill unavailable from now on
             return false;
         }
     }
-    // dedicated IO handle for chunk groups (the canonical runner uses one
-    // handle per shape group; reusing the group-0 handle mis-binds internals)
-    if (e->io_chunk == nullptr) {
-        if (axclrtEngineCreateIO(e->info, &e->io_chunk) != AXCL_SUCC) {
+    // dedicated IO handle PER shape group (the canonical runner uses one
+    // handle per group; sharing one across groups mis-binds internals)
+    if (g >= 12 || e->io_chunk[g] == nullptr) {
+        if (g >= 12 ||
+            axclrtEngineCreateIO(e->info, &e->io_chunk[g]) != AXCL_SUCC) {
             g_layer.n_groups = 1;
             return false;
         }
@@ -2687,22 +2778,28 @@ static bool axcl_layer_run_chunk(int l, int p, int ntok) {
     axclrtMemcpy(g_layer.d_mask_m, m, (size_t) ntok * w * 2, AXCL_MEMCPY_HOST_TO_DEVICE);
     // cache prefix: group 1 reads a single dummy row (masked out)
     const size_t kvb = (size_t) (p ? p : 1) * 1024 * 2;
-    axclrtEngineSetInputBufferByIndex(e->io_chunk, e->ik, e->dk, kvb);
-    axclrtEngineSetInputBufferByIndex(e->io_chunk, e->iv, e->dv, kvb);
-    axclrtEngineSetInputBufferByIndex(e->io_chunk, e->ii, g_layer.d_idx_m, (size_t) ntok * 4);
-    axclrtEngineSetInputBufferByIndex(e->io_chunk, e->ix, g_layer.d_chunk_in, (size_t) ntok * 1024 * 2);
-    axclrtEngineSetInputBufferByIndex(e->io_chunk, e->im, g_layer.d_mask_m, (size_t) ntok * w * 2);
-    axclrtEngineSetOutputBufferByIndex(e->io_chunk, e->iko, (char *) e->dk + (size_t) p * 1024 * 2,
+    axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->ik, e->dk, kvb);
+    axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->iv, e->dv, kvb);
+    axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->ii, g_layer.d_idx_m, (size_t) ntok * 4);
+    axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->ix, g_layer.d_chunk_in, (size_t) ntok * 1024 * 2);
+    axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->im, g_layer.d_mask_m, (size_t) ntok * w * 2);
+    axclrtEngineSetOutputBufferByIndex(e->io_chunk[g], e->iko, g_layer.d_chunk_ko,
                                        (size_t) ntok * 1024 * 2);
-    axclrtEngineSetOutputBufferByIndex(e->io_chunk, e->ivo, (char *) e->dv + (size_t) p * 1024 * 2,
+    axclrtEngineSetOutputBufferByIndex(e->io_chunk[g], e->ivo, g_layer.d_chunk_vo,
                                        (size_t) ntok * 1024 * 2);
-    axclrtEngineSetOutputBufferByIndex(e->io_chunk, e->iyo, g_layer.d_chunk_out, (size_t) ntok * 1024 * 2);
+    axclrtEngineSetOutputBufferByIndex(e->io_chunk[g], e->iyo, g_layer.d_chunk_out, (size_t) ntok * 1024 * 2);
 
     uint64_t t0 = axcl_us();
-    if (axclrtEngineExecute(e->model, e->ectx, (uint32_t) g, e->io_chunk) != AXCL_SUCC) {
+    if (axclrtEngineExecute(e->model, e->ectx, (uint32_t) g, e->io_chunk[g]) != AXCL_SUCC) {
         GGML_LOG_ERROR("ggml-axcl: layer %d chunk execute (group %d) failed\n", l, g);
         return false;
     }
+    // scatter K/V rows from staging into their cache slots (outputs execute
+    // into dedicated buffers; offset binds into the cache mis-execute)
+    axclrtMemcpy((char *) e->dk + (size_t) p * 1024 * 2, g_layer.d_chunk_ko,
+                 (size_t) ntok * 1024 * 2, AXCL_MEMCPY_DEVICE_TO_DEVICE);
+    axclrtMemcpy((char *) e->dv + (size_t) p * 1024 * 2, g_layer.d_chunk_vo,
+                 (size_t) ntok * 1024 * 2, AXCL_MEMCPY_DEVICE_TO_DEVICE);
     g_layer.us += axcl_us() - t0;
     g_layer.calls++;
     if (p + ntok > e->wm) e->wm = p + ntok;
@@ -2957,13 +3054,16 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                             swapped = true;
                             for (int l = 0; l < g_layer.n_layer; l++) {
                                 if (g_layer.eng[l].model != 0) {
-                                    if (g_layer.eng[l].io_chunk) axclrtEngineDestroyIO(g_layer.eng[l].io_chunk);
+                                    for (int gi = 0; gi < 12; gi++) {
+                                        if (g_layer.eng[l].io_chunk[gi])
+                                            axclrtEngineDestroyIO(g_layer.eng[l].io_chunk[gi]);
+                                    }
                                     axclrtEngineDestroyIO(g_layer.eng[l].io);
                                     axclrtEngineDestroyIOInfo(g_layer.eng[l].info);
                                     axclrtEngineUnload(g_layer.eng[l].model);
                                     g_layer.eng[l].model = 0;
                                     g_layer.eng[l].ectx = 0;
-                                    g_layer.eng[l].io_chunk = nullptr;
+                                    memset(g_layer.eng[l].io_chunk, 0, sizeof(g_layer.eng[l].io_chunk));
                                 }
                                 g_layer.eng[l].bound = false; // fresh IO handles after reload
                                 g_layer.host_wm[l] = 0;
@@ -3603,6 +3703,38 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             prof_t_host += axcl_us() - tt_h; prof_n_host++;
             if (hok) continue;
         }
+        if (node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
+            node->src[0]->ne[1] > 32768 && node->src[0]->ne[0] == 1024 &&
+            node->src[1]->ne[1] > 1 && node->src[1]->ne[1] <= 64 &&
+            getenv("GGML_AXCL_VOCAB64") != nullptr) {
+            // multi-position vocab matmul (speculative-verification batch):
+            // ONE 64-row head call replaces m rows of CPU vocab math
+            axcl_vocab64_load();
+            if (g_v64.ok) {
+                struct ggml_tensor * s1 = node->src[1];
+                const int64_t m = s1->ne[1];
+                float * st = g_v64.pin_in;
+                for (int64_t t = 0; t < m; t++)
+                    memcpy(st + (size_t) t * 1024, (const char *) s1->data + (size_t) t * s1->nb[1], 4096);
+                if (m < 64) memset(st + (size_t) m * 1024, 0, (size_t) (64 - m) * 4096);
+                std::lock_guard<std::mutex> lock(axcl_exec_mutex);
+                axclrtMemcpy(g_v64.dx, st, 64 * 1024 * 4, AXCL_MEMCPY_HOST_TO_DEVICE);
+                axclrtEngineSetInputBufferByIndex(g_v64.io, g_v64.ix, g_v64.dx, 64 * 1024 * 4);
+                axclrtEngineSetOutputBufferByIndex(g_v64.io, g_v64.iyo, g_v64.dy, (size_t) 64 * 151936 * 4);
+                if (axclrtEngineExecute(g_v64.model, g_v64.ectx, 0, g_v64.io) != AXCL_SUCC) {
+                    GGML_LOG_ERROR("ggml-axcl: vocab64 execute failed\n");
+                    return GGML_STATUS_ABORTED;
+                }
+                axclrtMemcpy(g_v64.pin_out, g_v64.dy, (size_t) m * 151936 * 4, AXCL_MEMCPY_DEVICE_TO_HOST);
+                for (int64_t t = 0; t < m; t++) {
+                    float * dstf = (float *)((char *) node->data + (size_t) t * node->nb[1]);
+                    memcpy(dstf, g_v64.pin_out + (size_t) t * 151936,
+                           (size_t) std::min<int64_t>(node->ne[0], 151936) * 4);
+                }
+                g_layer.post_hidden = nullptr;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_MUL_MAT && g_post.ok && node->src[0] &&
             node->src[0]->ne[1] > 32768 && node->src[0]->ne[0] == 1024 &&
             g_layer.post_hidden != nullptr) {
@@ -3610,7 +3742,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             // final hidden (no H2D), output = bf16 logits -> f32 dst
             std::lock_guard<std::mutex> lock(axcl_exec_mutex);
             axclrtEngineSetInputBufferByIndex(g_post.io, g_post.ix, g_layer.post_hidden, 1024 * 2);
-            axclrtEngineSetOutputBufferByIndex(g_post.io, g_post.iyo, g_post.dy, (size_t) 151936 * 2);
+            axclrtEngineSetOutputBufferByIndex(g_post.io, g_post.iyo, g_post.dy, (size_t) g_post.n_out * 2);
             if (axclrtEngineExecute(g_post.model, g_post.ectx, 0, g_post.io) != AXCL_SUCC) {
                 GGML_LOG_ERROR("ggml-axcl: post engine execute failed\n");
                 return GGML_STATUS_ABORTED;
@@ -3621,13 +3753,24 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     return GGML_STATUS_ABORTED;
                 }
             }
-            axclrtMemcpy(g_layer.pin_logits, g_post.dy, (size_t) 151936 * 2, AXCL_MEMCPY_DEVICE_TO_HOST);
+            axclrtMemcpy(g_layer.pin_logits, g_post.dy, (size_t) g_post.n_out * 2, AXCL_MEMCPY_DEVICE_TO_HOST);
             // llama.cpp samples from the LAST position's logits; for
             // multi-token graphs write the row it reads
             const int64_t mrows = node->ne[1];
             float * dstf = (float *)((char *) node->data + (size_t)(mrows - 1) * node->nb[1]);
             const int64_t nv = node->ne[0];
-            axcl_bf16_to_f32(g_layer.pin_logits, dstf, (int) std::min<int64_t>(nv, 151936));
+            if (g_post.trim_ids != nullptr) {
+                // trimmed post: scatter kept logits, -inf elsewhere
+                axcl_bf16_to_f32(g_layer.pin_logits, g_post.f32_scratch, g_post.n_out);
+                const int64_t nvf = std::min<int64_t>(nv, 151936);
+                for (int64_t v = 0; v < nvf; v++) dstf[v] = -INFINITY;
+                for (int k = 0; k < g_post.n_out; k++) {
+                    const int32_t id = g_post.trim_ids[k];
+                    if (id >= 0 && id < nvf) dstf[id] = g_post.f32_scratch[k];
+                }
+            } else {
+                axcl_bf16_to_f32(g_layer.pin_logits, dstf, (int) std::min<int64_t>(nv, 151936));
+            }
             g_layer_logits_on_npu = true;
             g_layer.post_hidden = nullptr;
             continue;
@@ -3965,6 +4108,10 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
         // whole-layer engines load regardless of the legacy-skip above; in
         // GGUF mode the loader defers to patched engines (see load_engines)
         if (getenv("GGML_AXCL_LAYER") != nullptr || getenv("GGML_AXCL_GGUF") != nullptr) {
+            axcl_vocab64_load();         // verify head loads FIRST — after the
+                                          // full engine set its 165MB load dies
+                                          // at a 258048B host->card DMA (solo
+                                          // load always works)
             axcl_layer_load_engines(-1); // layer count from template files
             axcl_post_load();            // 170MB — load now, not mid-graph
         }
