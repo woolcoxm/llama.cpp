@@ -2029,6 +2029,20 @@ static void axcl_patch_norm(char * eng, const axcl_layer_layout::N & n,
     }
 }
 
+// engine loads occasionally fail transiently when many loads/unloads churn
+// the device manager (observed ~1 per 300 loads in back-to-back runs) —
+// retry with a pause before giving up
+static axclError axcl_engine_load_file_retry(const char * path, uint64_t * model) {
+    axclError rc = axclrtEngineLoadFromFile(path, model);
+    // the device manager needs SECONDS to recover when process churn
+    // starves it (E2E back-to-back runs) — pace up to ~10s
+    for (int attempt = 0; rc != AXCL_SUCC && attempt < 6; attempt++) {
+        usleep(1500000 >> attempt); // 1.5s, 750ms, 375ms, ...
+        rc = axclrtEngineLoadFromFile(path, model);
+    }
+    return rc;
+}
+
 static bool axcl_layer_load_engines(int n_layer) {
     const char * dir = getenv("GGML_AXCL_LAYER_DIR");
     std::string d = dir ? dir : "/usr/local/share/ggml-axcl/layer";
@@ -2198,7 +2212,7 @@ static bool axcl_layer_load_engines(int n_layer) {
             snprintf(p, sizeof(p), "%s/qwen3_p128_l%d_together.axmodel", d.c_str(), l);
         }
         axcl_layer_engine * e = &g_layer.eng[l];
-        if (axclrtEngineLoadFromFile(p, &e->model) != AXCL_SUCC) {
+        if (axcl_engine_load_file_retry(p, &e->model) != AXCL_SUCC) {
             GGML_LOG_WARN("ggml-axcl: layer engine %s failed to load\n", p);
             return false;
         }
@@ -2718,7 +2732,13 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                             g_layer.loaded = false;
                             g_layer.n_layer = 0;
                             GGML_LOG_INFO("ggml-axcl: swapping to GGUF-patched engines\n");
-                            axcl_layer_load_engines(done_layers);
+                            if (!axcl_layer_load_engines(done_layers)) {
+                                GGML_LOG_WARN("ggml-axcl: swap failed, retrying in 3s\n");
+                                sleep(3);
+                                if (!axcl_layer_load_engines(done_layers)) {
+                                    GGML_LOG_ERROR("ggml-axcl: GGUF engine swap failed twice\n");
+                                }
+                            }
                         }
                     }
                 }
