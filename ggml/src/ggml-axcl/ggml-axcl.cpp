@@ -3323,12 +3323,18 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                                        getenv("GGML_AXCL_BATCH") != nullptr;
                 if (batching) {
                     // chunk ladder: full 128-token chunks through shape groups
-                    // 1..n; the tail is zero-padded to 128 by default
-                    // (GGML_AXCL_NOPAD: per-token remainder instead). Pad
-                    // tokens are causally after every real token; their KV
-                    // rows self-heal as decode advances.
+                    // 1..n. The ladder DEPTH IS BUILD-DEPENDENT: vendor sets
+                    // ship 10 groups (1152-token coverage), llm_build2 sets
+                    // as few as 3 (256-token coverage). Chunks beyond the
+                    // last rung fall back to per-token (group 0) — the tail
+                    // is zero-padded to 128 by default (GGML_AXCL_NOPAD:
+                    // per-token remainder instead). Pad tokens are causally
+                    // after every real token; their KV rows self-heal as
+                    // decode advances.
+                    const int ladder_cap = (g_layer.n_groups - 1) * 128;
                     static const bool pad_tail = getenv("GGML_AXCL_NOPAD") == nullptr;
-                    const int nch = pad_tail ? (m + 127) / 128 : m / 128;
+                    const int nch = std::min(pad_tail ? (m + 127) / 128 : m / 128,
+                                             ladder_cap / 128);
                     void * h_prev = (l == 0) ? g_layer.h_all_a
                                    : ((l % 2 == 1) ? g_layer.h_all_b : g_layer.h_all_a);
                     void * h_cur  = (l % 2 == 1) ? g_layer.h_all_a : g_layer.h_all_b;
@@ -3349,8 +3355,19 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                         }
                         (void) no_pad;
                         if (!axcl_layer_run_chunk(l, p, 128)) {
-                            GGML_LOG_ERROR("ggml-axcl: chunk ladder failed at layer %d chunk %d\n", l, c);
-                            return GGML_STATUS_ABORTED;
+                            // never abort: finish this layer per-token from
+                            // the failed chunk onward (correct on any ladder)
+                            for (int t = c * 128; t < m; t++) {
+                                g_layer.d_hidden = g_layer.d_hidden_m[t];
+                                void * outdev = nullptr;
+                                if (!axcl_layer_run(l, g_layer.pos + t, g_layer.host_k[l], g_layer.host_v[l],
+                                                    g_layer.k_nb1[l], g_layer.v_nb1[l], &outdev)) {
+                                    return GGML_STATUS_ABORTED;
+                                }
+                                axclrtMemcpy(g_layer.d_hidden_m[t], outdev, 2048,
+                                             AXCL_MEMCPY_DEVICE_TO_DEVICE);
+                            }
+                            break;
                         }
                         axclrtMemcpy((char *) h_cur + (size_t) c * 128 * 2048, g_layer.d_chunk_out,
                                      (size_t) real * 2048, AXCL_MEMCPY_DEVICE_TO_DEVICE);
