@@ -1889,6 +1889,16 @@ struct axcl_layer_engine {
     int wm = -1;  // watermark: highest written row + 1
     bool bound = false; // static IO bindings (K/V/idx/mask) done once
     axclrtEngineIO io_chunk[12] = {}; // dedicated IO handle PER shape group
+    // per-layer IO geometry (hybrid archs: qwen35 full-attention layers keep
+    // a real [ctx, kv_row] cache; linear-attention layers keep fixed-size
+    // recurrent state — conv state in K_cache, SSM state in V_cache — that
+    // the engine rewrites whole every call, so dk/dv hold two ping-pong
+    // copies and the bind alternates)
+    bool   linear = false;     // full-state rewrite layer (delta net)
+    uint32_t kv_row = 1024;    // attention: one position's K/V elems
+    uint64_t k_bytes = 0;      // attention: full K cache; linear: ONE K state copy
+    uint64_t v_bytes = 0;      // attention: full V cache; linear: ONE V state copy
+    bool   flip = false;       // linear: which ping-pong half feeds input
                                       // (shared handles mis-bind internals;
                                       // discovered via phase_c harnesses)
 };
@@ -1906,6 +1916,17 @@ struct axcl_layer_ctx {
     int n_layer = 0;
     int ctx_len = 2048;
     bool loaded = false;
+    // engine-set flavor: 0 = qwen3 (28 layers, dense attention), 1 = qwen3.5
+    // (hybrid: linear-attention delta-net layers + every-Nth full attention).
+    // Drives filename pattern, anchor shapes and KV-capture mapping.
+    int kind = 0;
+    char pat[96] = "qwen3_p128_l%d_together.axmodel"; // layer filename pattern
+    char post_name[96] = "qwen3_post.axmodel";
+    int  n_attn = 0;                    // kind=1: count of full-attention layers
+    int  attn_layers[64] = {0};         // kind=1: their layer indices, in order
+    uint32_t kv_row_attn = 1024;        // kind=1: K/V row width of attn layers
+    void * d_idx_lin = nullptr;         // kind=1: 1-elem dummy indices/mask the
+    void * d_mask_lin = nullptr;        //   linear layers' engines expect
     // shared device IO
     void * dx_in = nullptr;   // bf16 [1,1,1024] hidden input
     void * d_idx  = nullptr;  // u32
@@ -1978,6 +1999,17 @@ struct axcl_layer_ctx {
 static axcl_layer_ctx g_layer;
 static int n_layer_avail() { return g_layer.n_layer ? g_layer.n_layer : 28; }
 
+// layer-entry anchor matmul (weight side): the first projection of each
+// transformer layer, unique per layer so the prescan can count layers.
+// qwen3: q_proj [1024 -> 2048]. qwen3.5 hybrid: attention layers' attn_q
+// [1024 -> 4096] and delta-net layers' fused qkv/in_proj [1024 -> 6144] —
+// both unique (gate/up are 3584, attn gate 2048, k/v 512).
+static bool axcl_is_layer_anchor(const struct ggml_tensor * w) {
+    if (w == nullptr || w->ne[0] != 1024) return false;
+    if (g_layer.kind == 1) return w->ne[1] == 4096 || w->ne[1] == 6144;
+    return w->ne[1] == 2048;
+}
+
 // post engine: final norm + lm_head on NPU (bf16 hidden in, logits out)
 struct axcl_post_engine {
     uint64_t model = 0, ectx = 0;
@@ -2045,7 +2077,14 @@ static void axcl_post_load() {
     g_post.tried = true;
     const char * env = getenv("GGML_AXCL_POST_MODEL");
     char p[600];
-    snprintf(p, sizeof(p), "%s", env ? env : "/usr/local/share/ggml-axcl/layer/qwen3_post.axmodel");
+    if (env) {
+        snprintf(p, sizeof(p), "%s", env);
+    } else {
+        // default: the post engine that matches the loaded layer set
+        const char * dir = getenv("GGML_AXCL_LAYER_DIR");
+        snprintf(p, sizeof(p), "%s/%s", dir ? dir : "/usr/local/share/ggml-axcl/layer",
+                 g_layer.post_name);
+    }
     FILE * f = fopen(p, "r");
     if (!f) return;
     fclose(f);
@@ -2060,15 +2099,14 @@ static void axcl_post_load() {
     if (g_post.ix < 0 || g_post.iyo < 0) { g_post.model = 0; return; }
     uint64_t out_sz = axclrtEngineGetOutputSizeByIndex(g_post.info, 0, (uint32_t) g_post.iyo);
     if (out_sz > 4) g_post.n_out = (int) (out_sz / 2);   // assume bf16 logits
-    if (g_post.n_out != 151936) {
+    if (out_sz == (uint64_t) g_post.n_out * 4) g_post.out_f32 = true; // f32 head
+    if (getenv("GGML_AXCL_POST_TRIM") && g_post.n_out != 151936) {
         // vocab-trimmed post: load the kept-ids map (JSON int array); the
         // map count is ground truth for n_out — the engine may emit bf16
-        // (llm_build) or f32 (pulsar2 build) logits
+        // (llm_build) or f32 (pulsar2 build) logits. Without the env a
+        // non-151936 output is a plain full-vocab head (e.g. qwen3.5's
+        // 248,320) and needs no mapping.
         const char * tenv = getenv("GGML_AXCL_POST_TRIM");
-        if (!tenv) {
-            GGML_LOG_ERROR("ggml-axcl: trimmed post (%d logits) needs GGML_AXCL_POST_TRIM\n", g_post.n_out);
-            g_post.model = 0; return;
-        }
         FILE * tf = fopen(tenv, "r");
         if (!tf) { GGML_LOG_ERROR("ggml-axcl: trim map %s unreadable\n", tenv); g_post.model = 0; return; }
         static char buf[1 << 20];
@@ -2099,8 +2137,6 @@ static void axcl_post_load() {
         g_post.f32_scratch = (float *) malloc((size_t) g_post.n_out * 4);
         GGML_LOG_INFO("ggml-axcl: trimmed post (%d of 151936 vocab, %s logits)\n",
                       g_post.n_out, g_post.out_f32 ? "f32" : "bf16");
-    } else if (out_sz == (uint64_t) 151936 * 4) {
-        g_post.out_f32 = true;   // full-vocab pulsar2-build head
     }
     axclrtMalloc(&g_post.dy, out_sz ? out_sz : (size_t) 151936 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
     g_post.ok = true;
@@ -2239,29 +2275,44 @@ static bool axcl_layer_load_engines(int n_layer) {
         return false;
     }
     if (n_layer <= 0) {
-        // count templates in the directory
+        // count templates in the directory; the filename pattern also tells
+        // us which engine family (qwen3 dense vs qwen3.5 hybrid) we're driving
         DIR * dp = opendir(d.c_str());
         if (!dp) return false;
         struct dirent * de;
-        int cnt = 0;
+        int cnt = 0, cnt35 = 0;
         while ((de = readdir(dp)) != nullptr) {
             int l;
             if (sscanf(de->d_name, "qwen3_p128_l%d_together.axmodel", &l) == 1) cnt++;
+            if (sscanf(de->d_name, "qwen3_5_text_p128_l%d_together.axmodel", &l) == 1) cnt35++;
         }
         closedir(dp);
-        if (cnt <= 0 || cnt > 64) return false;
+        if (cnt35 > 0 && cnt35 <= 64) {
+            g_layer.kind = 1;
+            snprintf(g_layer.pat, sizeof(g_layer.pat), "%s", "qwen3_5_text_p128_l%d_together.axmodel");
+            snprintf(g_layer.post_name, sizeof(g_layer.post_name), "%s", "qwen3_5_text_post.axmodel");
+            cnt = cnt35;
+        } else if (cnt <= 0 || cnt > 64) {
+            return false;
+        }
         if (getenv("GGML_AXCL_LAYER_MAXL")) {
             int mx = atoi(getenv("GGML_AXCL_LAYER_MAXL"));
             if (mx > 0 && cnt > mx) cnt = mx;
         }
         g_layer.n_layer = n_layer = cnt;
     }
+    // the post-engine probe may have fired at backend init with the DEFAULT
+    // post filename — before this scan knew which engine family the layer
+    // dir holds. Re-allow one retry with the set's own post name.
+    if (!g_post.ok) g_post.tried = false;
     const char * stop_at = getenv("GGML_AXCL_LAYER_STOP"); // load1|a|kv|zero|shared|mask
     if (stop_at && strncmp(stop_at, "load", 4) == 0 && strcmp(stop_at, "load1") != 0) {
         int want = stop_at[4] ? atoi(stop_at + 4) : n_layer;
         for (int l = 0; l < want && l < n_layer; l++) {
             char p1[600];
-            snprintf(p1, sizeof(p1), "%s/qwen3_p128_l%d_together.axmodel", d.c_str(), l);
+            char pat_l[128];
+            snprintf(pat_l, sizeof(pat_l), g_layer.pat, l);
+            snprintf(p1, sizeof(p1), "%s/%s", d.c_str(), pat_l);
             uint64_t m1 = 0;
             if (axclrtEngineLoadFromFile(p1, &m1) != AXCL_SUCC) return false;
         }
@@ -2270,7 +2321,9 @@ static bool axcl_layer_load_engines(int n_layer) {
     }
     if (stop_at && strcmp(stop_at, "load1") == 0) {
         char p1[600];
-        snprintf(p1, sizeof(p1), "%s/qwen3_p128_l0_together.axmodel", d.c_str());
+        char pat_l[128];
+        snprintf(pat_l, sizeof(pat_l), g_layer.pat, 0);
+        snprintf(p1, sizeof(p1), "%s/%s", d.c_str(), pat_l);
         uint64_t m1 = 0;
         if (axclrtEngineLoadFromFile(p1, &m1) != AXCL_SUCC) return false;
         GGML_LOG_INFO("ggml-axcl: load1 probe only (model=%llx)\n", (unsigned long long) m1);
@@ -2281,11 +2334,16 @@ static bool axcl_layer_load_engines(int n_layer) {
     // patched files keyed by the weight pointers so reloads are free
     const char * gguf_dir = getenv("GGML_AXCL_GGUF_DIR");
     const bool want_gguf = getenv("GGML_AXCL_GGUF") != nullptr && g_gguf_n >= n_layer;
+    if (getenv("GGML_AXCL_GGUF") && g_layer.kind == 1) {
+        // qwen3.5 GGUF-patch mode is not wired yet (no layout sidecar for the
+        // hybrid engine format): vendor engines carry their own weights
+        GGML_LOG_WARN("ggml-axcl: GGML_AXCL_GGUF ignored for qwen3.5 engine sets (vendor-engine mode)\n");
+    }
     // GGUF mode: skip loading template engines at init — the weight registry
     // only fills during the first graph's prescan, and the engines loaded
     // now would be swapped out (a full wasted 28-engine load cycle).
     // Shared buffers + mask still get set up so the prescan can arm.
-    if (getenv("GGML_AXCL_GGUF") && g_gguf_n == 0 && n_layer <= 0) {
+    if (getenv("GGML_AXCL_GGUF") && g_gguf_n == 0 && n_layer <= 0 && g_layer.kind == 0) {
         DIR * dp = opendir(d.c_str());
         int cnt = 0;
         if (dp) {
@@ -2395,7 +2453,9 @@ static bool axcl_layer_load_engines(int n_layer) {
             snprintf(p, sizeof(p), "%s", dst);
             g_layer_from_gguf = true;
         } else {
-            snprintf(p, sizeof(p), "%s/qwen3_p128_l%d_together.axmodel", d.c_str(), l);
+            char pat_l[128];
+            snprintf(pat_l, sizeof(pat_l), g_layer.pat, l);
+            snprintf(p, sizeof(p), "%s/%s", d.c_str(), pat_l);
         }
         axcl_layer_engine * e = &g_layer.eng[l];
         if (axcl_engine_load_file_retry(p, &e->model) != AXCL_SUCC) {
@@ -2410,13 +2470,6 @@ static bool axcl_layer_load_engines(int n_layer) {
         axclrtEngineCreateContext(e->model, &e->ectx);
         if (stop_at && strcmp(stop_at, "a4") == 0) continue;
         e->ik = axclrtEngineGetInputIndexByName(e->info, "K_cache");
-        if (l == 0 && e->ik >= 0) {
-            axclrtEngineIODims dims;
-            if (axclrtEngineGetInputDims(e->info, 0, (uint32_t) e->ik, &dims) == AXCL_SUCC &&
-                dims.dimCount >= 2 && dims.dims[1] > 0 && dims.dims[1] <= 8192) {
-                g_layer.ctx_len = dims.dims[1];
-            }
-        }
         e->iv = axclrtEngineGetInputIndexByName(e->info, "V_cache");
         e->ii = axclrtEngineGetInputIndexByName(e->info, "indices");
         e->ix = axclrtEngineGetInputIndexByName(e->info, "input");
@@ -2429,11 +2482,54 @@ static bool axcl_layer_load_engines(int n_layer) {
             GGML_LOG_WARN("ggml-axcl: layer %d IO names not found\n", l);
             return false;
         }
+        // per-layer IO geometry. A layer whose K output is the same size as
+        // its K input rewrites a fixed-size buffer: that's a linear-attention
+        // (delta-net) layer — K_cache holds conv state, V_cache the SSM state,
+        // and the engine consumes them whole each call. Attention layers keep
+        // a [.., ctx, row] cache and emit one new row.
+        {
+            const uint64_t kin_sz  = axclrtEngineGetInputSizeByIndex(e->info, 0, (uint32_t) e->ik);
+            const uint64_t vin_sz  = axclrtEngineGetInputSizeByIndex(e->info, 0, (uint32_t) e->iv);
+            const uint64_t kout_sz = axclrtEngineGetOutputSizeByIndex(e->info, 0, (uint32_t) e->iko);
+            // linear-attention layers rewrite a fixed-size state (K out size
+            // == K in size; K = conv state, V = SSM state — different sizes!)
+            e->linear = (kin_sz > 0 && kout_sz == kin_sz);
+            if (e->linear) {
+                e->k_bytes = kin_sz;
+                e->v_bytes = vin_sz;
+            } else {
+                axclrtEngineIODims dims;
+                uint32_t ctx = 0, row = 0;
+                if (axclrtEngineGetInputDims(e->info, 0, (uint32_t) e->ik, &dims) == AXCL_SUCC &&
+                    dims.dimCount >= 2) {
+                    ctx = dims.dims[dims.dimCount - 2];
+                    row = dims.dims[dims.dimCount - 1];
+                }
+                if (ctx == 0 || ctx > 8192 || row == 0) {
+                    e->kv_row = 1024;
+                    e->k_bytes = e->v_bytes = kin_sz;
+                } else {
+                    e->kv_row = row;
+                    e->k_bytes = e->v_bytes = (uint64_t) ctx * row * 2;
+                }
+                if (g_layer.n_attn == 0) { // first attention layer sizes the ctx
+                    g_layer.ctx_len = (int) (e->k_bytes / 2 / e->kv_row);
+                    g_layer.kv_row_attn = e->kv_row;
+                }
+                if (g_layer.n_attn < 64) g_layer.attn_layers[g_layer.n_attn] = l;
+                g_layer.n_attn++;
+            }
+        }
         if (l == 0) {
             int32_t ngrp = 1;
             if (axclrtEngineGetShapeGroupsCount(e->info, &ngrp) == AXCL_SUCC && ngrp > 1) {
                 g_layer.n_groups = ngrp;
                 GGML_LOG_INFO("ggml-axcl: %d shape groups (batched prefill ladder available)\n", ngrp);
+            }
+            if (g_layer.kind == 1) {
+                // hybrid ladder not validated: linear layers would need chunk
+                // semantics (state advance across 128 tokens inside the engine)
+                g_layer.n_groups = 1;
             }
         }
         if (stop_at && strcmp(stop_at, "ctx") == 0) {
@@ -2452,21 +2548,29 @@ static bool axcl_layer_load_engines(int n_layer) {
             continue;
         }
         if (stop_at && stop_at[0] == 'a') continue;
-        const size_t kv_bytes = (size_t) g_layer.ctx_len * 1024 * 2;
-        if (axclrtMalloc(&e->dk, kv_bytes, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
-            axclrtMalloc(&e->dv, kv_bytes, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC) {
+        // attention: one full cache per side; linear: TWO state copies per
+        // side (ping-pong — the engine reads and rewrites the whole state;
+        // K and V states have DIFFERENT sizes on delta-net layers)
+        const size_t dk_bytes = e->linear ? (size_t) e->k_bytes * 2 : (size_t) e->k_bytes;
+        const size_t dv_bytes = e->linear ? (size_t) e->v_bytes * 2 : (size_t) e->v_bytes;
+        if (axclrtMalloc(&e->dk, dk_bytes, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            axclrtMalloc(&e->dv, dv_bytes, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC) {
             GGML_LOG_WARN("ggml-axcl: layer %d KV alloc failed\n", l);
             return false;
         }
         if (stop_at && strcmp(stop_at, "kv") == 0) continue;
         // zero-fill: uninitialized garbage can be NaN-shaped, and NaN scores
         // poison the softmax even through the -inf mask (NaN + -inf = NaN)
+        // (also the correct initial conv/SSM state for linear layers)
         {
             static std::vector<char> zeros;
             zeros.resize(1 << 20, 0);
-            for (size_t off = 0; off < kv_bytes; off += zeros.size()) {
-                size_t n = std::min(zeros.size(), kv_bytes - off);
+            for (size_t off = 0; off < dk_bytes; off += zeros.size()) {
+                size_t n = std::min(zeros.size(), dk_bytes - off);
                 axclrtMemcpy((char *) e->dk + off, zeros.data(), n, AXCL_MEMCPY_HOST_TO_DEVICE);
+            }
+            for (size_t off = 0; off < dv_bytes; off += zeros.size()) {
+                size_t n = std::min(zeros.size(), dv_bytes - off);
                 axclrtMemcpy((char *) e->dv + off, zeros.data(), n, AXCL_MEMCPY_HOST_TO_DEVICE);
             }
         }
@@ -2489,6 +2593,14 @@ static bool axcl_layer_load_engines(int n_layer) {
     axclrtMalloc(&g_layer.d_vout, 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
     axclrtMalloc(&g_layer.d_yout, 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
     axclrtMalloc(&g_layer.d_yout_alt, 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
+    if (g_layer.kind == 1 && g_layer.d_idx_lin == nullptr) {
+        // linear-attention engines carry 1-element mask inputs: a constant
+        // multiplicative gate the vendor fills with 1.0 (their attention
+        // masks use 0 / -65536 additive). indices still gets the real pos.
+        static const uint16_t one_bf16 = 0x3F80;
+        axclrtMalloc(&g_layer.d_mask_lin, 8, AXCL_MEM_MALLOC_HUGE_FIRST);
+        axclrtMemcpy(g_layer.d_mask_lin, &one_bf16, 2, AXCL_MEMCPY_HOST_TO_DEVICE);
+    }
     if (stop_at && strcmp(stop_at, "shared") == 0) { g_layer.loaded = true; return true; }
     if (stop_at && strcmp(stop_at, "maskup") == 0) {
         const size_t rowbx = ((size_t) (T + 1) * 2 + 7) & ~(size_t) 7;
@@ -2503,13 +2615,16 @@ static bool axcl_layer_load_engines(int n_layer) {
     // allow cache[0..p) + the self slot; mask stale cache[p..T).
     // Rows are padded to an 8-byte stride: card input buffers need sane
     // alignment (a 4098-byte stride broke every odd position).
+    // Masked value: qwen3 engines took -1e9; the qwen3.5 engines follow the
+    // vendor runtime's -65536 (bf16-safe on every path).
     {
+        const float masked = (g_layer.kind == 1) ? -65536.0f : -1e9f;
         const size_t rowb = ((size_t) (T + 1) * 2 + 7) & ~(size_t) 7;
         std::vector<char> m((size_t) T * rowb, 0);
         for (int p = 0; p < T; p++) {
             for (int t = 0; t <= T; t++) {
                 const bool allow = (t < p) || (t == T);
-                float v = allow ? 0.0f : -1e9f;
+                float v = allow ? 0.0f : masked;
                 uint32_t u;
                 memcpy(&u, &v, 4);
                 uint16_t b = (uint16_t) (u >> 16);
@@ -2531,7 +2646,8 @@ static bool axcl_layer_load_engines(int n_layer) {
         g_layer.mask_row_bytes = rowb;
     }
     g_layer.loaded = true;
-    GGML_LOG_INFO("ggml-axcl: %d whole-layer engines ready (ctx %d)\n", n_layer, T);
+    GGML_LOG_INFO("ggml-axcl: %d whole-layer engines ready (ctx %d, %d attn + %d linear, kv row %u)\n",
+                  n_layer, T, g_layer.n_attn, n_layer - g_layer.n_attn, g_layer.kv_row_attn);
     return true;
 }
 
@@ -2541,7 +2657,7 @@ static bool axcl_layer_load_engines(int n_layer) {
 // Rows are contiguous in the device cache -> one D2H per 64-row chunk per side.
 static void axcl_layer_flush_kv(int l) {
     axcl_layer_engine * e = &g_layer.eng[l];
-    if (g_layer.host_wm[l] >= e->wm) return;
+    if (e->linear || g_layer.host_wm[l] >= e->wm) return; // no host mirror of recurrent state
     struct ggml_tensor * kb = g_layer.kbase[l];
     struct ggml_tensor * vb = g_layer.vbase[l];
     if (kb == nullptr || vb == nullptr || g_layer.pin_row == nullptr) {
@@ -2555,6 +2671,7 @@ static void axcl_layer_flush_kv(int l) {
         }
     }
     const int T = g_layer.ctx_len;
+    const size_t row_bytes = (size_t) e->kv_row * 2;
     int lo = g_layer.host_wm[l];
     const int lim = std::min(e->wm, T);
     while (lo < lim) {
@@ -2562,20 +2679,21 @@ static void axcl_layer_flush_kv(int l) {
         for (int side = 0; side < 2; side++) {
             struct ggml_tensor * v = side ? vb : kb;
             char * base = (char *) (side ? e->dv : e->dk);
-            axclrtMemcpy(g_layer.pin_rows, base + (size_t) lo * 1024 * 2,
-                         (size_t) rows * 2048, AXCL_MEMCPY_DEVICE_TO_HOST);
+            axclrtMemcpy(g_layer.pin_rows, base + (size_t) lo * row_bytes,
+                         (size_t) rows * row_bytes, AXCL_MEMCPY_DEVICE_TO_HOST);
             const uint16_t * src = (const uint16_t *) g_layer.pin_rows;
             for (int p = 0; p < rows; p++) {
                 char * dst = (char *) v->data + (size_t) (lo + p) * v->nb[1];
+                const uint16_t * srow = src + (size_t) p * e->kv_row;
                 if (v->type == GGML_TYPE_BF16) {
-                    memcpy(dst, src + (size_t) p * 1024, 2048);
+                    memcpy(dst, srow, row_bytes);
                 } else if (v->type == GGML_TYPE_F16) {
                     float f[1024];
-                    axcl_bf16_to_f32(src + (size_t) p * 1024, f, 1024);
+                    axcl_bf16_to_f32(srow, f, (int) e->kv_row);
                     ggml_fp16_t * h = (ggml_fp16_t *) dst;
-                    for (int i = 0; i < 1024; i++) h[i] = GGML_COMPUTE_FP32_TO_FP16(f[i]);
+                    for (int i = 0; i < (int) e->kv_row; i++) h[i] = GGML_COMPUTE_FP32_TO_FP16(f[i]);
                 } else if (v->type == GGML_TYPE_F32) {
-                    axcl_bf16_to_f32(src + (size_t) p * 1024, (float *) dst, 1024);
+                    axcl_bf16_to_f32(srow, (float *) dst, (int) e->kv_row);
                 }
             }
         }
@@ -2590,24 +2708,26 @@ static void axcl_layer_flush_kv_all() {
 
 // upload host cache rows [0, pos) into layer l's device caches (bf16)
 static void axcl_layer_resync(int l, int pos) {
+    axcl_layer_engine * e = &g_layer.eng[l];
+    if (e->linear) return; // recurrent state has no host mirror to sync from
     if (g_layer.kbase[l] == nullptr || g_layer.vbase[l] == nullptr || pos <= 0) return;
     axcl_layer_flush_kv(l); // device rows beyond host_wm must land before host wins
-    axcl_layer_engine * e = &g_layer.eng[l];
     const int T = g_layer.ctx_len;
-    std::vector<float> row(1024);
-    std::vector<uint16_t> buf((size_t) T * 1024);
+    const int R = (int) e->kv_row;
+    std::vector<float> row(R);
+    std::vector<uint16_t> buf((size_t) T * R);
     for (int side = 0; side < 2; side++) {
         struct ggml_tensor * v = side ? g_layer.vbase[l] : g_layer.kbase[l];
         const int64_t nb1 = v->nb[1];
         for (int t = 0; t < pos && t < T; t++) {
-            axcl_kv_fetch((const char *) v->data + (size_t) t * nb1, v->type, row.data(), 1024);
-            for (int i = 0; i < 1024; i++) {
+            axcl_kv_fetch((const char *) v->data + (size_t) t * nb1, v->type, row.data(), R);
+            for (int i = 0; i < R; i++) {
                 uint32_t u;
                 memcpy(&u, &row[i], 4);
-                buf[(size_t) t * 1024 + i] = (uint16_t) (u >> 16);
+                buf[(size_t) t * R + i] = (uint16_t) (u >> 16);
             }
         }
-        axclrtMemcpy(side ? e->dv : e->dk, buf.data(), (size_t) pos * 1024 * 2,
+        axclrtMemcpy(side ? e->dv : e->dk, buf.data(), (size_t) pos * R * 2,
                      AXCL_MEMCPY_HOST_TO_DEVICE);
     }
     e->wm = pos;
@@ -2663,13 +2783,17 @@ static bool axcl_layer_run(int l, int pos,
     // window so save-state / crash paths never lose more than 32 rows
     if (l == 0 && (pos & 31) == 31) axcl_layer_flush_kv_all();
 
-    const size_t kv_bytes = (size_t) T * 1024 * 2;
     // static bindings once per engine; per-call: hidden ping-pong + K/V rows
     if (!e->bound) {
-        axclrtEngineSetInputBufferByIndex(e->io, e->ik, e->dk, kv_bytes);
-        axclrtEngineSetInputBufferByIndex(e->io, e->iv, e->dv, kv_bytes);
-        axclrtEngineSetInputBufferByIndex(e->io, e->ii, g_layer.d_idx, 4);
-        axclrtEngineSetInputBufferByIndex(e->io, e->im, g_layer.d_mask_row, (size_t) (T + 1) * 2);
+        if (e->linear) {
+            axclrtEngineSetInputBufferByIndex(e->io, e->ii, g_layer.d_idx, 4);
+            axclrtEngineSetInputBufferByIndex(e->io, e->im, g_layer.d_mask_lin, 2);
+        } else {
+            axclrtEngineSetInputBufferByIndex(e->io, e->ik, e->dk, (size_t) e->k_bytes);
+            axclrtEngineSetInputBufferByIndex(e->io, e->iv, e->dv, (size_t) e->v_bytes);
+            axclrtEngineSetInputBufferByIndex(e->io, e->ii, g_layer.d_idx, 4);
+            axclrtEngineSetInputBufferByIndex(e->io, e->im, g_layer.d_mask_row, (size_t) (T + 1) * 2);
+        }
         e->bound = true;
     }
     // K/V outputs land straight in the cache row (2KB-aligned; the row is
@@ -2677,12 +2801,30 @@ static bool axcl_layer_run(int l, int pos,
     // restores the old kout-buffer + scatter path for A/B testing.
     static const bool kv_inplace = getenv("GGML_AXCL_KV_INPLACE") == nullptr ||
                                    atoi(getenv("GGML_AXCL_KV_INPLACE")) != 0;
-    void * krow = kv_inplace ? (char *) e->dk + (size_t) pos * 1024 * 2 : g_layer.d_kout;
-    void * vrow = kv_inplace ? (char *) e->dv + (size_t) pos * 1024 * 2 : g_layer.d_vout;
+    const size_t row_bytes = (size_t) e->kv_row * 2;
+    void * krow, * vrow;
+    size_t kout_sz, vout_sz;
+    if (e->linear) {
+        // whole-state rewrite: input = one ping-pong half, output = the other
+        axclrtEngineSetInputBufferByIndex(e->io, e->ik, (char *) e->dk + (e->flip ? e->k_bytes : 0), (size_t) e->k_bytes);
+        axclrtEngineSetInputBufferByIndex(e->io, e->iv, (char *) e->dv + (e->flip ? e->v_bytes : 0), (size_t) e->v_bytes);
+        krow = (char *) e->dk + (e->flip ? 0 : e->k_bytes);
+        vrow = (char *) e->dv + (e->flip ? 0 : e->v_bytes);
+        kout_sz = (size_t) e->k_bytes;
+        vout_sz = (size_t) e->v_bytes;
+    } else if (kv_inplace) {
+        krow = (char *) e->dk + (size_t) pos * row_bytes;
+        vrow = (char *) e->dv + (size_t) pos * row_bytes;
+        kout_sz = vout_sz = row_bytes;
+    } else {
+        krow = g_layer.d_kout;
+        vrow = g_layer.d_vout;
+        kout_sz = vout_sz = row_bytes;
+    }
     axclrtEngineSetInputBufferByIndex(e->io, e->ix, g_layer.d_hidden, 1024 * 2);
     g_layer.y_next = (g_layer.d_hidden == g_layer.d_yout) ? g_layer.d_yout_alt : g_layer.d_yout;
-    axclrtEngineSetOutputBufferByIndex(e->io, e->iko, krow, 1024 * 2);
-    axclrtEngineSetOutputBufferByIndex(e->io, e->ivo, vrow, 1024 * 2);
+    axclrtEngineSetOutputBufferByIndex(e->io, e->iko, krow, kout_sz);
+    axclrtEngineSetOutputBufferByIndex(e->io, e->ivo, vrow, vout_sz);
     axclrtEngineSetOutputBufferByIndex(e->io, e->iyo, g_layer.y_next, 1024 * 2);
 
     uint64_t t0 = axcl_us();
@@ -2715,14 +2857,16 @@ static bool axcl_layer_run(int l, int pos,
         g_layer.calls++;
     }
 
-    if (!kv_inplace) {
+    if (e->linear) {
+        e->flip = !e->flip; // next call reads the half this call wrote
+    } else if (!kv_inplace) {
         // scatter the new row into the device cache
-        axclrtMemcpy((char *) e->dk + (size_t) pos * 1024 * 2, g_layer.d_kout, 1024 * 2,
+        axclrtMemcpy((char *) e->dk + (size_t) pos * row_bytes, g_layer.d_kout, row_bytes,
                      AXCL_MEMCPY_DEVICE_TO_DEVICE);
-        axclrtMemcpy((char *) e->dv + (size_t) pos * 1024 * 2, g_layer.d_vout, 1024 * 2,
+        axclrtMemcpy((char *) e->dv + (size_t) pos * row_bytes, g_layer.d_vout, row_bytes,
                      AXCL_MEMCPY_DEVICE_TO_DEVICE);
     }
-    if (pos >= e->wm) e->wm = pos + 1;
+    if (!e->linear && pos >= e->wm) e->wm = pos + 1;
 
     // host cache write-back: DEFERRED by default (llama.cpp never reads these
     // rows while the engines own decode — attention runs on-card). GGML_AXCL_KVWB=now
@@ -2899,8 +3043,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             if (n->op == GGML_OP_GET_ROWS && n->src[0] && n->src[0]->ne[0] == 1024 &&
                 n->src[0]->ne[1] > 32768) {
                 gets++;
-            } else if (n->op == GGML_OP_MUL_MAT && n->src[0] && n->src[0]->ne[0] == 1024 &&
-                       n->src[0]->ne[1] == 2048 && n->src[1]) {
+            } else if (n->op == GGML_OP_MUL_MAT && axcl_is_layer_anchor(n->src[0]) && n->src[1]) {
                 anchors++;
                 if (n->src[1]->ne[1] != 1) all_m1 = false;
             }
@@ -2924,7 +3067,9 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             g_layer.next_layer = 0;
             // GGUF weight registry: stash layer tensors by shape. Layer order
             // = anchor order; matrices by (rows, cols); norms by size.
-            if (getenv("GGML_AXCL_GGUF") && !g_layer_from_gguf) {
+            // (qwen3 engine sets only — the layout sidecar doesn't exist for
+            // the hybrid engine format yet)
+            if (getenv("GGML_AXCL_GGUF") && !g_layer_from_gguf && g_layer.kind == 0) {
                 int anchor_i = -1;
                 for (int i = 0; i < cgraph->n_nodes; i++) {
                     struct ggml_tensor * n = cgraph->nodes[i];
@@ -3144,10 +3289,15 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 g_layer.armed = false;
                 layer_armed = false;
             }
-            // prescan capture: KV cache views (SET_ROWS dsts in order) + pos
+            // prescan capture: KV cache views (SET_ROWS dsts in order) + pos.
+            // Hybrid archs: only the full-attention layers carry a KV cache
+            // (the linear layers' recurrent state has no host mirror) — pairs
+            // map onto g_layer.attn_layers[], not consecutive indices.
+            const int kv_layers = g_layer.kind == 1 ? g_layer.n_attn : g_layer.n_layer;
+            const int64_t kv_row_w = g_layer.kind == 1 ? (int64_t) g_layer.kv_row_attn : 1024;
             int kv_seen = 0;
             int pos = -1;
-            for (int i = 0; i < cgraph->n_nodes && kv_seen < 2 * g_layer.n_layer; i++) {
+            for (int i = 0; i < cgraph->n_nodes && kv_seen < 2 * kv_layers; i++) {
                 struct ggml_tensor * n = cgraph->nodes[i];
                 if (n->op == GGML_OP_SET_ROWS && getenv("GGML_AXCL_LAYER_DEBUG2") && kv_seen < 4) {
                     fprintf(stderr, "[sr] dst ne=[%lld,%lld,%lld] nb1=%zu ty=%d | ids ne=[%lld] ty=%d id0=%d\n",
@@ -3157,7 +3307,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                         (int)(n->src[1]?n->src[1]->type:-1),
                         (n->src[1] && n->src[1]->type==GGML_TYPE_I32) ? *(const int32_t*)n->src[1]->data : -999);
                 }
-                if (n->op == GGML_OP_SET_ROWS && n->src[0] && n->src[0]->ne[0] == 1024 &&
+                if (n->op == GGML_OP_SET_ROWS && n->src[0] && n->src[0]->ne[0] == kv_row_w &&
                     n->src[1] && (n->src[1]->type == GGML_TYPE_I32 || n->src[1]->type == GGML_TYPE_I64) &&
                     n->src[1]->ne[0] >= 1 &&
                     n->nb[1] > 0) {
@@ -3165,7 +3315,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                                                                     : *(const int32_t *) n->src[1]->data;
                     int id = (int) id64;
                     if (kv_seen == 0) pos = id;
-                    int l = kv_seen / 2;
+                    int l = g_layer.kind == 1 ? g_layer.attn_layers[kv_seen / 2] : kv_seen / 2;
                     if (kv_seen % 2 == 0) { g_layer.host_k[l] = n; g_layer.k_nb1[l] = n->nb[1]; }
                     else                  { g_layer.host_v[l] = n; g_layer.v_nb1[l] = n->nb[1]; }
                     kv_seen++;
@@ -3174,15 +3324,16 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             g_layer.pos_last_pass = g_layer.pos;
             g_layer.pos = pos;
             // cache-base detection for resync: distinct VIEW/RESHAPE bases of
-            // [1024, >=ctx] tensors, in graph order = K0,V0,K1,V1...
+            // [kv_row, >=ctx] tensors, in graph order = K0,V0,K1,V1... (attn
+            // layers only on hybrid archs)
             {
                 struct ggml_tensor * bases[128];
                 int nb = 0;
-                for (int i = 0; i < cgraph->n_nodes && nb < 2 * g_layer.n_layer; i++) {
+                for (int i = 0; i < cgraph->n_nodes && nb < 2 * kv_layers; i++) {
                     struct ggml_tensor * n2 = cgraph->nodes[i];
                     for (int s = 0; s < 2; s++) {
                         struct ggml_tensor * b = s ? n2->src[1] : n2->src[0];
-                        if (b == nullptr || b->ne[0] != 1024 || b->ne[1] < g_layer.ctx_len ||
+                        if (b == nullptr || b->ne[0] != kv_row_w || b->ne[1] < g_layer.ctx_len ||
                             b->ne[2] != 1 || b->ne[1] > 8192) { // not embed/lm_head
                             continue;
                         }
@@ -3191,15 +3342,16 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                         if (!dup) bases[nb++] = b;
                     }
                 }
-                if (nb == 2 * g_layer.n_layer) {
-                    for (int l = 0; l < g_layer.n_layer; l++) {
-                        g_layer.kbase[l] = bases[2 * l];
-                        g_layer.vbase[l] = bases[2 * l + 1];
+                if (nb == 2 * kv_layers) {
+                    for (int k = 0; k < kv_layers; k++) {
+                        const int l = g_layer.kind == 1 ? g_layer.attn_layers[k] : k;
+                        g_layer.kbase[l] = bases[2 * k];
+                        g_layer.vbase[l] = bases[2 * k + 1];
                     }
                 }
             }
             // rewind / first-use: resync device caches from the host caches
-            if (pos > 0 && kv_seen == 2 * g_layer.n_layer) {
+            if (pos > 0 && kv_seen == 2 * kv_layers) {
                 for (int l = 0; l < g_layer.n_layer; l++) {
                     if (g_layer.eng[l].wm != pos) {
                         axcl_layer_resync(l, pos);
@@ -3290,8 +3442,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 g_layer.d_hidden = g_layer.d_hidden_m[0];
                 continue;
             }
-            if (node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
-                node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] == 2048) {
+            if (node->op == GGML_OP_MUL_MAT && axcl_is_layer_anchor(node->src[0])) {
                 const int l = g_layer.next_layer++;
                 if (l >= g_layer.n_layer || g_layer.pos < 0) {
                     GGML_LOG_ERROR("ggml-axcl: whole-layer state broken (l=%d pos=%d)\n", l, g_layer.pos);
@@ -3788,7 +3939,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 return GGML_STATUS_ABORTED;
             }
             if (g_layer.pin_logits == nullptr) {
-                if (axclrtMallocHost((void **) &g_layer.pin_logits, 151936 * 4) != AXCL_SUCC) {
+                if (axclrtMallocHost((void **) &g_layer.pin_logits, (size_t) g_post.n_out * 4) != AXCL_SUCC) {
                     GGML_LOG_ERROR("ggml-axcl: pinned logits staging alloc failed\n");
                     return GGML_STATUS_ABORTED;
                 }
@@ -3808,19 +3959,28 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     axcl_bf16_to_f32(g_layer.pin_logits, g_post.f32_scratch, g_post.n_out);
                     src = g_post.f32_scratch;
                 }
-                const int64_t nvf = std::min<int64_t>(nv, 151936);
+                const int64_t nvf = std::min<int64_t>(nv, g_post.n_out);
                 for (int64_t v = 0; v < nvf; v++) dstf[v] = -INFINITY;
                 for (int k = 0; k < g_post.n_out; k++) {
                     const int32_t id = g_post.trim_ids[k];
                     if (id >= 0 && id < nvf) dstf[id] = src[k];
                 }
             } else if (g_post.out_f32) {
-                memcpy(dstf, g_layer.pin_logits, (size_t) std::min<int64_t>(nv, 151936) * 4);
+                memcpy(dstf, g_layer.pin_logits, (size_t) std::min<int64_t>(nv, g_post.n_out) * 4);
             } else {
-                axcl_bf16_to_f32(g_layer.pin_logits, dstf, (int) std::min<int64_t>(nv, 151936));
+                axcl_bf16_to_f32(g_layer.pin_logits, dstf, (int) std::min<int64_t>(nv, g_post.n_out));
             }
             g_layer_logits_on_npu = true;
             g_layer.post_hidden = nullptr;
+            if (getenv("GGML_AXCL_TOP1_DEBUG")) {
+                // greedy argmax of the row we just wrote (diagnostic for EOG)
+                const int64_t nvf = std::min<int64_t>(nv, g_post.n_out);
+                int top = 0;
+                for (int64_t v = 1; v < nvf; v++) if (dstf[v] > dstf[top]) top = v;
+                fprintf(stderr, "[top1] pos=%d id=%d logit=%.4f second=%.4f\n",
+                        g_layer.pos, top, dstf[top],
+                        [&]{ float m = -1e30f; for (int64_t v = 0; v < nvf; v++) if (v != top && dstf[v] > m) m = dstf[v]; return m; }());
+            }
             continue;
         }
         if (node->op == GGML_OP_MUL_MAT) {
