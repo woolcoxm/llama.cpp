@@ -1978,14 +1978,17 @@ struct axcl_layer_ctx {
 static axcl_layer_ctx g_layer;
 static int n_layer_avail() { return g_layer.n_layer ? g_layer.n_layer : 28; }
 
-// post engine: final norm + lm_head on NPU (bf16 hidden in, bf16 logits out)
+// post engine: final norm + lm_head on NPU (bf16 hidden in, logits out)
 struct axcl_post_engine {
     uint64_t model = 0, ectx = 0;
     axclrtEngineIOInfo info = nullptr;
     axclrtEngineIO io = nullptr;
     int ix = -1, iyo = -1;
-    void * dy = nullptr;             // logits [n_out] bf16
+    void * dy = nullptr;             // logits [n_out] bf16 or f32
     bool ok = false;
+    bool tried = false;              // never retry a failed load (per-token
+                                     // reloads of a bad engine cost ~4s/token)
+    bool out_f32 = false;            // pulsar2-build heads emit f32 logits
     // vocab-trimmed post: n_out < 151936 logits, expanded via trim_ids
     int n_out = 151936;
     int32_t * trim_ids = nullptr;    // trimmed position -> full token id
@@ -2038,7 +2041,8 @@ static void axcl_vocab64_load() {
 }
 
 static void axcl_post_load() {
-    if (g_post.ok || g_layer.n_layer == 0) return;
+    if (g_post.ok || g_post.tried) return;
+    g_post.tried = true;
     const char * env = getenv("GGML_AXCL_POST_MODEL");
     char p[600];
     snprintf(p, sizeof(p), "%s", env ? env : "/usr/local/share/ggml-axcl/layer/qwen3_post.axmodel");
@@ -2051,11 +2055,15 @@ static void axcl_post_load() {
     axclrtEngineCreateContext(g_post.model, &g_post.ectx);
     g_post.ix = axclrtEngineGetInputIndexByName(g_post.info, "input");
     g_post.iyo = axclrtEngineGetOutputIndexByName(g_post.info, "output");
+    if (g_post.ix < 0) g_post.ix = axclrtEngineGetInputIndexByName(g_post.info, "X");       // pulsar2-build engines
+    if (g_post.iyo < 0) g_post.iyo = axclrtEngineGetOutputIndexByName(g_post.info, "Y");    // use ONNX names
     if (g_post.ix < 0 || g_post.iyo < 0) { g_post.model = 0; return; }
     uint64_t out_sz = axclrtEngineGetOutputSizeByIndex(g_post.info, 0, (uint32_t) g_post.iyo);
-    if (out_sz > 4) g_post.n_out = (int) (out_sz / 2);   // bf16 logits
+    if (out_sz > 4) g_post.n_out = (int) (out_sz / 2);   // assume bf16 logits
     if (g_post.n_out != 151936) {
-        // vocab-trimmed post: load the kept-ids map (JSON int array)
+        // vocab-trimmed post: load the kept-ids map (JSON int array); the
+        // map count is ground truth for n_out — the engine may emit bf16
+        // (llm_build) or f32 (pulsar2 build) logits
         const char * tenv = getenv("GGML_AXCL_POST_TRIM");
         if (!tenv) {
             GGML_LOG_ERROR("ggml-axcl: trimmed post (%d logits) needs GGML_AXCL_POST_TRIM\n", g_post.n_out);
@@ -2063,28 +2071,38 @@ static void axcl_post_load() {
         }
         FILE * tf = fopen(tenv, "r");
         if (!tf) { GGML_LOG_ERROR("ggml-axcl: trim map %s unreadable\n", tenv); g_post.model = 0; return; }
-        char buf[1 << 20];
+        static char buf[1 << 20];
         int len = (int) fread(buf, 1, sizeof(buf) - 1, tf);
         fclose(tf);
         buf[len] = 0;
-        g_post.trim_ids = (int32_t *) malloc((size_t) g_post.n_out * 4);
+        static int32_t tmp_ids[200000];
         int n = 0; char * s = buf;
-        while (n < g_post.n_out && *s) {
+        while (n < 200000 && *s) {
             while (*s && (*s == ',' || *s == ' ' || *s == '[' || *s == ']')) s++;
             if (!*s) break;
             char * s0 = s;
             long v = strtol(s, &s, 10);
             if (s == s0) break;
-            g_post.trim_ids[n++] = (int32_t) v;
+            tmp_ids[n++] = (int32_t) v;
         }
-        g_post.f32_scratch = (float *) malloc((size_t) g_post.n_out * 4);
-        if (n != g_post.n_out) {
-            GGML_LOG_ERROR("ggml-axcl: trim map has %d ids, engine emits %d\n", n, g_post.n_out);
+        if (out_sz == (uint64_t) n * 2) {
+            g_post.n_out = n; g_post.out_f32 = false;
+        } else if (out_sz == (uint64_t) n * 4) {
+            g_post.n_out = n; g_post.out_f32 = true;
+        } else {
+            GGML_LOG_ERROR("ggml-axcl: trim map has %d ids, engine output %llu B does not match bf16/f32\n",
+                           n, (unsigned long long) out_sz);
             g_post.model = 0; return;
         }
-        GGML_LOG_INFO("ggml-axcl: trimmed post (%d of 151936 vocab)\n", g_post.n_out);
+        g_post.trim_ids = (int32_t *) malloc((size_t) g_post.n_out * 4);
+        memcpy(g_post.trim_ids, tmp_ids, (size_t) g_post.n_out * 4);
+        g_post.f32_scratch = (float *) malloc((size_t) g_post.n_out * 4);
+        GGML_LOG_INFO("ggml-axcl: trimmed post (%d of 151936 vocab, %s logits)\n",
+                      g_post.n_out, g_post.out_f32 ? "f32" : "bf16");
+    } else if (out_sz == (uint64_t) 151936 * 4) {
+        g_post.out_f32 = true;   // full-vocab pulsar2-build head
     }
-    axclrtMalloc(&g_post.dy, (size_t) g_post.n_out * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
+    axclrtMalloc(&g_post.dy, out_sz ? out_sz : (size_t) 151936 * 2, AXCL_MEM_MALLOC_HUGE_FIRST);
     g_post.ok = true;
     GGML_LOG_INFO("ggml-axcl: post engine ready (NPU logits)\n");
 }
@@ -3706,6 +3724,9 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         if (node->op == GGML_OP_MUL_MAT && node->src[0] && node->src[1] &&
             node->src[0]->ne[1] > 32768 && node->src[0]->ne[0] == 1024 &&
             node->src[1]->ne[1] > 1 && node->src[1]->ne[1] <= 64 &&
+            node->src[1]->ne[0] == 1024 && node->src[1]->nb[0] == 4 &&
+            node->src[1]->nb[1] == 4096 && node->src[1]->data != nullptr &&
+            node->nb[1] >= 151936 * 4 &&
             getenv("GGML_AXCL_VOCAB64") != nullptr) {
             // multi-position vocab matmul (speculative-verification batch):
             // ONE 64-row head call replaces m rows of CPU vocab math
@@ -3741,19 +3762,21 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             // vocab head via the post engine: input = the device-resident
             // final hidden (no H2D), output = bf16 logits -> f32 dst
             std::lock_guard<std::mutex> lock(axcl_exec_mutex);
+            const size_t elem = g_post.out_f32 ? 4 : 2;
             axclrtEngineSetInputBufferByIndex(g_post.io, g_post.ix, g_layer.post_hidden, 1024 * 2);
-            axclrtEngineSetOutputBufferByIndex(g_post.io, g_post.iyo, g_post.dy, (size_t) g_post.n_out * 2);
+            axclrtEngineSetOutputBufferByIndex(g_post.io, g_post.iyo, g_post.dy,
+                                               (size_t) g_post.n_out * elem);
             if (axclrtEngineExecute(g_post.model, g_post.ectx, 0, g_post.io) != AXCL_SUCC) {
                 GGML_LOG_ERROR("ggml-axcl: post engine execute failed\n");
                 return GGML_STATUS_ABORTED;
             }
             if (g_layer.pin_logits == nullptr) {
-                if (axclrtMallocHost((void **) &g_layer.pin_logits, 151936 * 2) != AXCL_SUCC) {
+                if (axclrtMallocHost((void **) &g_layer.pin_logits, 151936 * 4) != AXCL_SUCC) {
                     GGML_LOG_ERROR("ggml-axcl: pinned logits staging alloc failed\n");
                     return GGML_STATUS_ABORTED;
                 }
             }
-            axclrtMemcpy(g_layer.pin_logits, g_post.dy, (size_t) g_post.n_out * 2, AXCL_MEMCPY_DEVICE_TO_HOST);
+            axclrtMemcpy(g_layer.pin_logits, g_post.dy, (size_t) g_post.n_out * elem, AXCL_MEMCPY_DEVICE_TO_HOST);
             // llama.cpp samples from the LAST position's logits; for
             // multi-token graphs write the row it reads
             const int64_t mrows = node->ne[1];
@@ -3761,13 +3784,21 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             const int64_t nv = node->ne[0];
             if (g_post.trim_ids != nullptr) {
                 // trimmed post: scatter kept logits, -inf elsewhere
-                axcl_bf16_to_f32(g_layer.pin_logits, g_post.f32_scratch, g_post.n_out);
+                const float * src;
+                if (g_post.out_f32) {
+                    src = (const float *) g_layer.pin_logits;
+                } else {
+                    axcl_bf16_to_f32(g_layer.pin_logits, g_post.f32_scratch, g_post.n_out);
+                    src = g_post.f32_scratch;
+                }
                 const int64_t nvf = std::min<int64_t>(nv, 151936);
                 for (int64_t v = 0; v < nvf; v++) dstf[v] = -INFINITY;
                 for (int k = 0; k < g_post.n_out; k++) {
                     const int32_t id = g_post.trim_ids[k];
-                    if (id >= 0 && id < nvf) dstf[id] = g_post.f32_scratch[k];
+                    if (id >= 0 && id < nvf) dstf[id] = src[k];
                 }
+            } else if (g_post.out_f32) {
+                memcpy(dstf, g_layer.pin_logits, (size_t) std::min<int64_t>(nv, 151936) * 4);
             } else {
                 axcl_bf16_to_f32(g_layer.pin_logits, dstf, (int) std::min<int64_t>(nv, 151936));
             }
@@ -4108,12 +4139,13 @@ ggml_backend_t ggml_backend_axcl_init(int32_t device) {
         // whole-layer engines load regardless of the legacy-skip above; in
         // GGUF mode the loader defers to patched engines (see load_engines)
         if (getenv("GGML_AXCL_LAYER") != nullptr || getenv("GGML_AXCL_GGUF") != nullptr) {
-            axcl_vocab64_load();         // verify head loads FIRST — after the
-                                          // full engine set its 165MB load dies
-                                          // at a 258048B host->card DMA (solo
-                                          // load always works)
+            // LOAD ORDER MATTERS (vendor runtime bug, V3.10.2): loading a
+            // `pulsar2 build` engine AFTER any llm_build engine drops the
+            // PCIe device ("recv dma size 0" — 2-engine repro in FINDINGS).
+            // pulsar2-build heads (vocab64, trimmed post) load FIRST.
+            axcl_vocab64_load();
+            axcl_post_load();
             axcl_layer_load_engines(-1); // layer count from template files
-            axcl_post_load();            // 170MB — load now, not mid-graph
         }
         if (!no_engines && !layer_only) {
         // QKV fused engine: rms_norm(hidden) -> q, k, v in one call
