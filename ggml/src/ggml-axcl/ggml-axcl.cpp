@@ -1927,6 +1927,14 @@ struct axcl_layer_ctx {
     uint32_t kv_row_attn = 1024;        // kind=1: K/V row width of attn layers
     void * d_idx_lin = nullptr;         // kind=1: 1-elem dummy indices/mask the
     void * d_mask_lin = nullptr;        //   linear layers' engines expect
+    // vision (mtmd) support: image ubatches arrive as pure EMBEDDING rows —
+    // no token GET_ROWS — plus M-RoPE positions (3 components/token) that
+    // the attention engines take via their [3,128] chunk-indices input
+    struct ggml_tensor * inp_embd = nullptr; // host-filled embedding rows
+    const int32_t * pos_in = nullptr;       // rope positions (host, i32)
+    int pos_per_tok = 1;                    // 1 = plain rope, 3 = mrope
+    bool embd_batch = false;
+    bool embd_staged = false;
     // shared device IO
     void * dx_in = nullptr;   // bf16 [1,1,1024] hidden input
     void * d_idx  = nullptr;  // u32
@@ -2650,7 +2658,7 @@ static bool axcl_layer_load_engines(int n_layer) {
     // first chunk call used to malloc them mid-graph, and device mallocs
     // between the first graph's engine executes faulted the runtime's memory
     // service on hybrid sets ("memory memcpy nil pointer" + card wedge).
-    if (g_layer.n_groups > 1 && g_layer.d_chunk_in == nullptr) {
+    if (g_layer.kind == 1 && g_layer.n_groups > 1 && g_layer.d_chunk_in == nullptr) {
         const int w_max = g_layer.n_groups * 128; // widest 2D mask row
         if (axclrtMalloc(&g_layer.d_chunk_in, 128 * 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
             axclrtMalloc(&g_layer.d_chunk_out, 128 * 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
@@ -3013,9 +3021,10 @@ static bool axcl_layer_run_chunk(int l, int p, int ntok, int real) {
     if (g < 1 || g >= g_layer.n_groups || ntok != 128) return false;
     const int T = g_layer.ctx_len;
     if (p + ntok > T) return false;
-    // (chunk-ladder buffers + pinned staging are allocated at load time —
-    // see axcl_layer_load_engines)
-    if (g_layer.d_chunk_in == nullptr) return false;
+    // kind1: chunk buffers allocated at load (mid-graph device mallocs fault
+    // the memory service on hybrid sets). kind0: the verbatim path allocates
+    // lazily itself — leave it exactly as verified.
+    if (g_layer.kind == 1 && g_layer.d_chunk_in == nullptr) return false;
     // dedicated IO handle PER shape group (the canonical runner uses one
     // handle per group; sharing one across groups mis-binds internals)
     if (g >= 12 || e->io_chunk[g] == nullptr) {
@@ -3034,8 +3043,23 @@ static bool axcl_layer_run_chunk(int l, int p, int ntok, int real) {
         uint32_t * ix = (uint32_t *) g_layer.pin_idx_m;
         memset(ix, 0, 1536);
         if (g_layer.kind == 1) {
-            // hybrid sets: vendor convention — real positions, zero pad
-            for (int i = 0; i < nr; i++) ix[i] = (uint32_t) (p + i);
+            // hybrid sets: M-RoPE — the attention engines' [3,128] indices
+            // carry the (t,h,w) triple per token (text degenerates to equal
+            // rows; vision tokens differ). Linear engines take row 0 only.
+            for (int i = 0; i < nr; i++) {
+                const int t = p + i;
+                if (g_layer.pos_in != nullptr) {
+                    const int np = g_layer.pos_per_tok;
+                    const int base = t * np;
+                    ix[i] = (uint32_t) g_layer.pos_in[base];
+                    if (np == 3) {
+                        ix[128 + i] = (uint32_t) g_layer.pos_in[base + 1];
+                        ix[256 + i] = (uint32_t) g_layer.pos_in[base + 2];
+                    }
+                } else {
+                    ix[i] = (uint32_t) t;
+                }
+            }
         } else {
             // qwen3 sets were verified with ALL 128 positions filled (pad
             // rows rope at p+i; their outputs are masked out either way)
@@ -3209,11 +3233,13 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
     if (layer_env && g_layer.loaded) {
         int anchors = 0, gets = 0;
         bool all_m1 = true;
+        struct ggml_tensor * emb_gr = nullptr;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             struct ggml_tensor * n = cgraph->nodes[i];
             if (n->op == GGML_OP_GET_ROWS && n->src[0] && n->src[0]->ne[0] == 1024 &&
                 n->src[0]->ne[1] > 32768) {
                 gets++;
+                emb_gr = n; // vision ubatches carry a dead one w/ garbage ids
             } else if (n->op == GGML_OP_MUL_MAT && axcl_is_layer_anchor(n->src[0]) && n->src[1]) {
                 anchors++;
                 if (n->src[1]->ne[1] != 1) all_m1 = false;
@@ -3445,8 +3471,53 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 }
                 fprintf(stderr, "\n");
             }
-            // token count: the embedding GET_ROWS output row count
+            // token count: the embedding GET_ROWS output row count (token
+            // batches), or the embd input's rows (vision batches)
             g_layer.n_tok = 1;
+            if (g_layer.embd_batch) {
+                const int m = (int) g_layer.inp_embd->ne[1];
+                g_layer.n_tok = m;
+                // stage rows exactly like the token path: per-token device
+                // buffers + the h_all slab when the ladder will batch them
+                if ((int) g_layer.d_hidden_m.size() < m) g_layer.d_hidden_m.resize(m, nullptr);
+                if (g_layer.pin_hidden == nullptr) {
+                    if (axclrtMallocHost(&g_layer.pin_hidden, 2048) != AXCL_SUCC) return GGML_STATUS_ABORTED;
+                }
+                const int ladder_batch_v = g_layer.kind == 1 ? (g_layer.n_groups - 1) * 128 : 1152;
+                bool slab = g_layer.n_groups > 1 && m > 1 && m <= ladder_batch_v;
+                if (slab && g_layer.h_all_a == nullptr) {
+                    if (axclrtMalloc(&g_layer.h_all_a, (size_t) m * 2048, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+                        axclrtMalloc(&g_layer.h_all_b, (size_t) m * 2048, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+                        axclrtMallocHost(&g_layer.pin_h_all, (size_t) m * 2048) != AXCL_SUCC) {
+                        slab = false;
+                    }
+                }
+                // ONE device slab for all rows — hundreds of tiny per-row
+                // axclrtMallocs corrupt the driver's host-side bookkeeping
+                // (crash inside libaxcl_pkg's allocator on this stack)
+                static void * embd_slab = nullptr;
+                static int embd_slab_rows = 0;
+                if (embd_slab_rows < m) {
+                    if (embd_slab) axclrtFree(embd_slab);
+                    if (axclrtMalloc(&embd_slab, (size_t) m * 2048, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC) embd_slab = nullptr;
+                    embd_slab_rows = embd_slab ? m : 0;
+                }
+                if (embd_slab) {
+                    uint16_t * hb = slab ? (uint16_t *) g_layer.pin_h_all : (uint16_t *) g_layer.pin_hidden;
+                    for (int t = 0; t < m; t++) {
+                        const float * row = (const float *)((char *) g_layer.inp_embd->data + (size_t) t * g_layer.inp_embd->nb[1]);
+                        axcl_f32_to_bf16(row, hb + (size_t) t * 1024, 1024);
+                        g_layer.d_hidden_m[t] = (char *) embd_slab + (size_t) t * 2048;
+                    }
+                    axclrtMemcpy(embd_slab, hb, (size_t) m * 2048, AXCL_MEMCPY_HOST_TO_DEVICE);
+                }
+                if (slab) {
+                    axclrtMemcpy(g_layer.h_all_a, g_layer.pin_h_all, (size_t) m * 2048, AXCL_MEMCPY_HOST_TO_DEVICE);
+                    g_layer.batched_last_hbuf = nullptr;
+                }
+                g_layer.d_hidden = g_layer.d_hidden_m[0];
+                g_layer.embd_staged = true;
+            }
             g_layer.pos_base = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 struct ggml_tensor * n = cgraph->nodes[i];
@@ -3566,7 +3637,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
         // anchor; all other layer-internal nodes are subsumed by the engine
         if (g_layer.armed) {
             if (node->op == GGML_OP_GET_ROWS && node->src[0] != nullptr &&
-                node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] > 32768) {
+                node->src[0]->ne[0] == 1024 && node->src[0]->ne[1] > 32768 && !g_layer.embd_batch) {
                 // embedding lookup: host compute, then bf16 -> device inputs
                 if (!ggml_axcl_host_op(node)) return GGML_STATUS_ABORTED;
                 const int m = (int) node->ne[1];
@@ -3664,6 +3735,13 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 const int ladder_batch2 = g_layer.kind == 1 ? (g_layer.n_groups - 1) * 128 : 1152;
                 const bool batching = m > 1 && g_layer.n_groups > 1 && m <= ladder_batch2 && g_layer.h_all_a != nullptr &&
                                        getenv("GGML_AXCL_BATCH") != nullptr;
+                if (getenv("GGML_AXCL_BATCH") && m > 1) {
+                    static bool bgate = false;
+                    if (!bgate) { bgate = true;
+                        fprintf(stderr, "[bgate] m=%d n_groups=%d ladder=%d h_all_a=%p batching=%d kind=%d\n",
+                                m, g_layer.n_groups, ladder_batch2, (void*)g_layer.h_all_a, (int)batching, g_layer.kind);
+                    }
+                }
                 if (batching) {
                     // chunk ladder: full 128-token chunks through shape groups
                     // 1..n. The ladder DEPTH IS BUILD-DEPENDENT: vendor sets
