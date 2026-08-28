@@ -1951,9 +1951,13 @@ struct axcl_layer_ctx {
     struct ggml_tensor * host_k[64] = {nullptr};
     struct ggml_tensor * host_v[64] = {nullptr};
     int64_t k_nb1[64] = {0}, v_nb1[64] = {0};
-    // full cache base tensors ([1024, n_ctx]) for resync
-    struct ggml_tensor * kbase[64] = {nullptr};
-    struct ggml_tensor * vbase[64] = {nullptr};
+    // full-cache destinations for flush/resync, captured as VALUE snapshots
+    // (data ptr, row stride, type) from the first graph that exposes them:
+    // the per-build view tensors die on graph rebuilds, but the underlying
+    // llama.cpp KV buffer lives for the whole context
+    void * kdata[64] = {nullptr}, * vdata[64] = {nullptr};
+    int64_t knb1[64] = {0}, vnb1[64] = {0};
+    int32_t ktype[64] = {0}, vtype[64] = {0};
     int pos = -1, pos_last_pass = -1;
     struct ggml_tensor * final_norm = nullptr;
     struct ggml_tensor * out_add = nullptr;
@@ -1987,6 +1991,8 @@ struct axcl_layer_ctx {
     void * d_chunk_ko  = nullptr; // [128,1024] bf16 K rows out (dedicated —
                                   // offset output binds mis-execute)
     void * d_chunk_vo  = nullptr; // [128,1024] bf16 V rows out
+    void * d_linmask_m = nullptr; // kind=1: [128] bf16 linear chunk gate mask
+    void * pin_linmask_m = nullptr;
     void * pin_idx_m   = nullptr; // [128] u32 pinned
     void * pin_mask_m  = nullptr; // [128,1152] bf16 pinned
     void * pin_chunk   = nullptr; // [128,1024] bf16 pinned (layer-0 H2D)
@@ -2526,11 +2532,6 @@ static bool axcl_layer_load_engines(int n_layer) {
                 g_layer.n_groups = ngrp;
                 GGML_LOG_INFO("ggml-axcl: %d shape groups (batched prefill ladder available)\n", ngrp);
             }
-            if (g_layer.kind == 1) {
-                // hybrid ladder not validated: linear layers would need chunk
-                // semantics (state advance across 128 tokens inside the engine)
-                g_layer.n_groups = 1;
-            }
         }
         if (stop_at && strcmp(stop_at, "ctx") == 0) {
             axclrtEngineGetIOInfo(e->model, &e->info);
@@ -2645,6 +2646,30 @@ static bool axcl_layer_load_engines(int n_layer) {
         }
         g_layer.mask_row_bytes = rowb;
     }
+    // chunk-ladder buffers + pinned staging allocate HERE (load time): the
+    // first chunk call used to malloc them mid-graph, and device mallocs
+    // between the first graph's engine executes faulted the runtime's memory
+    // service on hybrid sets ("memory memcpy nil pointer" + card wedge).
+    if (g_layer.n_groups > 1 && g_layer.d_chunk_in == nullptr) {
+        const int w_max = g_layer.n_groups * 128; // widest 2D mask row
+        if (axclrtMalloc(&g_layer.d_chunk_in, 128 * 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            axclrtMalloc(&g_layer.d_chunk_out, 128 * 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            axclrtMalloc(&g_layer.d_idx_m, 1536, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            axclrtMalloc(&g_layer.d_mask_m, (size_t) 128 * w_max * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            // K/V_out must land in DEDICATED buffers — binding outputs into
+            // cache rows at byte offsets silently mis-executes on this
+            // runtime (phase_c_refcheck: offset output binds are the reason
+            // the chunk ladder was ever believed broken)
+            axclrtMalloc(&g_layer.d_chunk_ko, 128 * 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            axclrtMalloc(&g_layer.d_chunk_vo, 128 * 1024 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            axclrtMalloc(&g_layer.d_linmask_m, 128 * 2, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
+            axclrtMallocHost(&g_layer.pin_idx_m, 1536) != AXCL_SUCC ||
+            axclrtMallocHost(&g_layer.pin_mask_m, (size_t) 128 * w_max * 2) != AXCL_SUCC ||
+            axclrtMallocHost(&g_layer.pin_linmask_m, 128 * 2) != AXCL_SUCC) {
+            GGML_LOG_WARN("ggml-axcl: chunk buffer alloc failed — batched prefill disabled\n");
+            g_layer.n_groups = 1;
+        }
+    }
     g_layer.loaded = true;
     GGML_LOG_INFO("ggml-axcl: %d whole-layer engines ready (ctx %d, %d attn + %d linear, kv row %u)\n",
                   n_layer, T, g_layer.n_attn, n_layer - g_layer.n_attn, g_layer.kv_row_attn);
@@ -2657,10 +2682,13 @@ static bool axcl_layer_load_engines(int n_layer) {
 // Rows are contiguous in the device cache -> one D2H per 64-row chunk per side.
 static void axcl_layer_flush_kv(int l) {
     axcl_layer_engine * e = &g_layer.eng[l];
+    static const bool fdbg = getenv("GGML_AXCL_FLUSH_DEBUG") != nullptr;
+    if (fdbg) fprintf(stderr, "[flush] l=%d linear=%d host_wm=%d wm=%d kdata=%p vdata=%p pin_row=%p\n",
+                      l, (int)e->linear, g_layer.host_wm[l], e->wm, g_layer.kdata[l],
+                      g_layer.vdata[l], g_layer.pin_row);
     if (e->linear || g_layer.host_wm[l] >= e->wm) return; // no host mirror of recurrent state
-    struct ggml_tensor * kb = g_layer.kbase[l];
-    struct ggml_tensor * vb = g_layer.vbase[l];
-    if (kb == nullptr || vb == nullptr || g_layer.pin_row == nullptr) {
+    void * kdst = g_layer.kdata[l], * vdst = g_layer.vdata[l];
+    if (kdst == nullptr || vdst == nullptr || g_layer.pin_row == nullptr) {
         g_layer.host_wm[l] = e->wm; // nowhere to write; drop the range
         return;
     }
@@ -2677,22 +2705,24 @@ static void axcl_layer_flush_kv(int l) {
     while (lo < lim) {
         const int rows = std::min(lim - lo, 64);
         for (int side = 0; side < 2; side++) {
-            struct ggml_tensor * v = side ? vb : kb;
+            char * dst_base = (char *) (side ? vdst : kdst);
+            const int64_t dst_nb1 = side ? g_layer.vnb1[l] : g_layer.knb1[l];
+            const int dst_ty = side ? g_layer.vtype[l] : g_layer.ktype[l];
             char * base = (char *) (side ? e->dv : e->dk);
             axclrtMemcpy(g_layer.pin_rows, base + (size_t) lo * row_bytes,
                          (size_t) rows * row_bytes, AXCL_MEMCPY_DEVICE_TO_HOST);
             const uint16_t * src = (const uint16_t *) g_layer.pin_rows;
             for (int p = 0; p < rows; p++) {
-                char * dst = (char *) v->data + (size_t) (lo + p) * v->nb[1];
+                char * dst = dst_base + (size_t) (lo + p) * dst_nb1;
                 const uint16_t * srow = src + (size_t) p * e->kv_row;
-                if (v->type == GGML_TYPE_BF16) {
+                if (dst_ty == GGML_TYPE_BF16) {
                     memcpy(dst, srow, row_bytes);
-                } else if (v->type == GGML_TYPE_F16) {
+                } else if (dst_ty == GGML_TYPE_F16) {
                     float f[1024];
                     axcl_bf16_to_f32(srow, f, (int) e->kv_row);
                     ggml_fp16_t * h = (ggml_fp16_t *) dst;
                     for (int i = 0; i < (int) e->kv_row; i++) h[i] = GGML_COMPUTE_FP32_TO_FP16(f[i]);
-                } else if (v->type == GGML_TYPE_F32) {
+                } else if (dst_ty == GGML_TYPE_F32) {
                     axcl_bf16_to_f32(srow, (float *) dst, (int) e->kv_row);
                 }
             }
@@ -2710,17 +2740,18 @@ static void axcl_layer_flush_kv_all() {
 static void axcl_layer_resync(int l, int pos) {
     axcl_layer_engine * e = &g_layer.eng[l];
     if (e->linear) return; // recurrent state has no host mirror to sync from
-    if (g_layer.kbase[l] == nullptr || g_layer.vbase[l] == nullptr || pos <= 0) return;
+    if (g_layer.kdata[l] == nullptr || g_layer.vdata[l] == nullptr || pos <= 0) return;
     axcl_layer_flush_kv(l); // device rows beyond host_wm must land before host wins
     const int T = g_layer.ctx_len;
     const int R = (int) e->kv_row;
     std::vector<float> row(R);
     std::vector<uint16_t> buf((size_t) T * R);
     for (int side = 0; side < 2; side++) {
-        struct ggml_tensor * v = side ? g_layer.vbase[l] : g_layer.kbase[l];
-        const int64_t nb1 = v->nb[1];
+        char * src_base = (char *) (side ? g_layer.vdata[l] : g_layer.kdata[l]);
+        const int64_t nb1 = side ? g_layer.vnb1[l] : g_layer.knb1[l];
+        const int src_ty = side ? g_layer.vtype[l] : g_layer.ktype[l];
         for (int t = 0; t < pos && t < T; t++) {
-            axcl_kv_fetch((const char *) v->data + (size_t) t * nb1, v->type, row.data(), R);
+            axcl_kv_fetch(src_base + (size_t) t * nb1, (ggml_type) src_ty, row.data(), R);
             for (int i = 0; i < R; i++) {
                 uint32_t u;
                 memcpy(&u, &row[i], 4);
@@ -2880,12 +2911,17 @@ static bool axcl_layer_run(int l, int pos,
 }
 
 // batched prefill chunk: run 128 tokens at absolute position p of layer l
-// through shape-group (1 + p/128) — the vendor ladder (groups 1..9, prefix
-// grows 0..1024). Input rows are staged into d_chunk_in (offset bindings are
-// unreliable on this runtime); K/V rows land in-place in the cache; the
-// chunk's hidden output lands in d_chunk_out. Returns false if the ladder
-// can't serve this chunk (caller falls back to per-token group 0).
-static bool axcl_layer_run_chunk(int l, int p, int ntok) {
+// through shape-group (1 + p/128) — the vendor ladder (group g serves prefix
+// (g-1)*128, growing to the set's depth). Input rows are staged into
+// d_chunk_in (offset bindings are unreliable on this runtime); attention K/V
+// rows land in dedicated buffers then scatter into the cache; the chunk's
+// hidden output lands in d_chunk_out. Hybrid sets (kind=1): attention layers
+// bind a prefix view of their cache + a 2D causal mask; linear layers fold
+// the whole chunk into their recurrent state (ping-pong halves, gate mask
+// 1.0 for the chunk's real tokens and 0.0 for pad). `real` = valid tokens in
+// this chunk (tail chunk < 128). Returns false if the ladder can't serve
+// this chunk (caller falls back to per-token group 0).
+static bool axcl_layer_run_chunk_q3(int l, int p, int ntok) { // verbatim 9db8049 (pre-hybrid)
     axcl_layer_engine * e = &g_layer.eng[l];
     const int g = 1 + p / 128;
     if (g < 1 || g >= g_layer.n_groups || ntok != 128) return false;
@@ -2962,6 +2998,141 @@ static bool axcl_layer_run_chunk(int l, int p, int ntok) {
                  (size_t) ntok * 1024 * 2, AXCL_MEMCPY_DEVICE_TO_DEVICE);
     axclrtMemcpy((char *) e->dv + (size_t) p * 1024 * 2, g_layer.d_chunk_vo,
                  (size_t) ntok * 1024 * 2, AXCL_MEMCPY_DEVICE_TO_DEVICE);
+    g_layer.us += axcl_us() - t0;
+    g_layer.calls++;
+    if (p + ntok > e->wm) e->wm = p + ntok;
+    return true;
+}
+
+
+static bool axcl_layer_run_chunk(int l, int p, int ntok, int real) {
+    axcl_layer_engine * e = &g_layer.eng[l];
+    const int g = 1 + p / 128;
+    static const bool cdbg = getenv("GGML_AXCL_CHUNK_DEBUG") != nullptr;
+    if (cdbg) fprintf(stderr, "[chunk] enter l=%d p=%d g=%d ntok=%d real=%d linear=%d\n", l, p, g, ntok, real, (int) e->linear);
+    if (g < 1 || g >= g_layer.n_groups || ntok != 128) return false;
+    const int T = g_layer.ctx_len;
+    if (p + ntok > T) return false;
+    // (chunk-ladder buffers + pinned staging are allocated at load time —
+    // see axcl_layer_load_engines)
+    if (g_layer.d_chunk_in == nullptr) return false;
+    // dedicated IO handle PER shape group (the canonical runner uses one
+    // handle per group; sharing one across groups mis-binds internals)
+    if (g >= 12 || e->io_chunk[g] == nullptr) {
+        if (g >= 12 ||
+            axclrtEngineCreateIO(e->info, &e->io_chunk[g]) != AXCL_SUCC) {
+            g_layer.n_groups = 1;
+            return false;
+        }
+        if (cdbg) fprintf(stderr, "[chunk] io_chunk[%d] created\n", g);
+    }
+    const int nr = std::max(1, std::min(real, 128));
+    // indices: absolute rope positions of the chunk's tokens, zero-padded
+    // (attention groups carry a [3,128] slot table, linear a [1,128] row —
+    // the vendor memsets the whole table and fills the first row)
+    {
+        uint32_t * ix = (uint32_t *) g_layer.pin_idx_m;
+        memset(ix, 0, 1536);
+        if (g_layer.kind == 1) {
+            // hybrid sets: vendor convention — real positions, zero pad
+            for (int i = 0; i < nr; i++) ix[i] = (uint32_t) (p + i);
+        } else {
+            // qwen3 sets were verified with ALL 128 positions filled (pad
+            // rows rope at p+i; their outputs are masked out either way)
+            for (int i = 0; i < ntok; i++) ix[i] = (uint32_t) (p + i);
+        }
+        axclrtMemcpy(g_layer.d_idx_m, g_layer.pin_idx_m, 1536, AXCL_MEMCPY_HOST_TO_DEVICE);
+        if (cdbg) fprintf(stderr, "[chunk] idx uploaded\n");
+    }
+    if (e->linear) {
+        // ---- delta-net layer: the engine folds all 128 tokens into the
+        // recurrent state in one call. Same ping-pong as decode; the gate
+        // mask marks real tokens 1.0 and pad 0.0 (pad must not move state).
+        // (d_linmask_m + staging allocated at load)
+        static int lm_pos = -1, lm_real = -1;
+        if (lm_pos != p || lm_real != nr) {
+            uint16_t * lm = (uint16_t *) g_layer.pin_linmask_m;
+            const uint16_t one = 0x3F80; // bf16 1.0
+            for (int i = 0; i < 128; i++) lm[i] = (i < nr) ? one : 0;
+            axclrtMemcpy(g_layer.d_linmask_m, lm, 128 * 2, AXCL_MEMCPY_HOST_TO_DEVICE);
+            lm_pos = p; lm_real = nr;
+        }
+        if (cdbg) fprintf(stderr, "[chunk] linmask ready\n");
+        axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->ik, (char *) e->dk + (e->flip ? e->k_bytes : 0), (size_t) e->k_bytes);
+        axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->iv, (char *) e->dv + (e->flip ? e->v_bytes : 0), (size_t) e->v_bytes);
+        axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->ii, g_layer.d_idx_m, 512);
+        axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->ix, g_layer.d_chunk_in, 128 * 1024 * 2);
+        axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->im, g_layer.d_linmask_m, 128 * 2);
+        axclrtEngineSetOutputBufferByIndex(e->io_chunk[g], e->iko, (char *) e->dk + (e->flip ? 0 : e->k_bytes), (size_t) e->k_bytes);
+        axclrtEngineSetOutputBufferByIndex(e->io_chunk[g], e->ivo, (char *) e->dv + (e->flip ? 0 : e->v_bytes), (size_t) e->v_bytes);
+        axclrtEngineSetOutputBufferByIndex(e->io_chunk[g], e->iyo, g_layer.d_chunk_out, 128 * 1024 * 2);
+        uint64_t t0 = axcl_us();
+        if (cdbg) fprintf(stderr, "[chunk] l=%d g=%d exec (linear)\n", l, g);
+        if (axclrtEngineExecute(e->model, e->ectx, (uint32_t) g, e->io_chunk[g]) != AXCL_SUCC) {
+            GGML_LOG_ERROR("ggml-axcl: layer %d linear chunk execute (group %d) failed\n", l, g);
+            return false;
+        }
+        if (cdbg) fprintf(stderr, "[chunk] l=%d g=%d exec ok\n", l, g);
+        e->flip = !e->flip;
+        g_layer.us += axcl_us() - t0;
+        g_layer.calls++;
+        return true;
+    }
+    // ---- attention layer
+    // causal mask: token p+i attends columns j <= p+i, width p+128.
+    // GGML_AXCL_CMSK=strict excludes the diagonal (decode's self-attention
+    // runs through the engine's internal self slot, not the mask)
+    static const bool strict_diag = getenv("GGML_AXCL_CMSK") != nullptr &&
+                                    strcmp(getenv("GGML_AXCL_CMSK"), "strict") == 0;
+    static int am_pos = -1;
+    const int w = p + ntok;
+    if (g_layer.kind == 1 && am_pos != p) { // bisect: hoist only for kind1
+        const float masked = (g_layer.kind == 1) ? -65536.0f : -1e9f;
+        uint16_t * m = (uint16_t *) g_layer.pin_mask_m;
+        for (int i = 0; i < ntok; i++) {
+            const int lim = strict_diag ? (p + i - 1) : (p + i);
+            for (int j = 0; j < w; j++) {
+                float v = (j <= lim) ? 0.0f : masked;
+                uint32_t u;
+                memcpy(&u, &v, 4);
+                m[(size_t) i * w + j] = (uint16_t) (u >> 16);
+            }
+        }
+        axclrtMemcpy(g_layer.d_mask_m, m, (size_t) ntok * w * 2, AXCL_MEMCPY_HOST_TO_DEVICE);
+        am_pos = p;
+    }
+    // cache prefix: the group reads exactly its prefix rows from OUR full
+    // cache (base bind, reduced size — offset binds mis-execute). Group 1
+    // carries a 2-row dummy (its mask has no history columns at all).
+    size_t kvb;
+    if (g_layer.kind == 1) kvb = (g == 1) ? 2048 : (size_t) (g - 1) * 128 * e->kv_row * 2;
+    else                   kvb = (size_t) (p ? p : 1) * 1024 * 2;
+    const size_t row_bytes = (size_t) e->kv_row * 2;
+    axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->ik, e->dk, kvb);
+    axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->iv, e->dv, kvb);
+    axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->ii, g_layer.d_idx_m,
+                                      g_layer.kind == 1 ? 1536 : (size_t) ntok * 4);
+    axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->ix, g_layer.d_chunk_in, (size_t) ntok * 1024 * 2);
+    axclrtEngineSetInputBufferByIndex(e->io_chunk[g], e->im, g_layer.d_mask_m, (size_t) ntok * w * 2);
+    axclrtEngineSetOutputBufferByIndex(e->io_chunk[g], e->iko, g_layer.d_chunk_ko,
+                                       (size_t) ntok * row_bytes);
+    axclrtEngineSetOutputBufferByIndex(e->io_chunk[g], e->ivo, g_layer.d_chunk_vo,
+                                       (size_t) ntok * row_bytes);
+    axclrtEngineSetOutputBufferByIndex(e->io_chunk[g], e->iyo, g_layer.d_chunk_out, (size_t) ntok * 1024 * 2);
+
+    uint64_t t0 = axcl_us();
+    if (cdbg) fprintf(stderr, "[chunk] l=%d g=%d exec (attn, kvb=%zu)\n", l, g, kvb);
+    if (axclrtEngineExecute(e->model, e->ectx, (uint32_t) g, e->io_chunk[g]) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: layer %d chunk execute (group %d) failed\n", l, g);
+        return false;
+    }
+    if (cdbg) fprintf(stderr, "[chunk] l=%d g=%d exec ok\n", l, g);
+    // scatter K/V rows from staging into their cache slots (outputs execute
+    // into dedicated buffers; offset binds into the cache mis-execute)
+    axclrtMemcpy((char *) e->dk + (size_t) p * row_bytes, g_layer.d_chunk_ko,
+                 (size_t) ntok * row_bytes, AXCL_MEMCPY_DEVICE_TO_DEVICE);
+    axclrtMemcpy((char *) e->dv + (size_t) p * row_bytes, g_layer.d_chunk_vo,
+                 (size_t) ntok * row_bytes, AXCL_MEMCPY_DEVICE_TO_DEVICE);
     g_layer.us += axcl_us() - t0;
     g_layer.calls++;
     if (p + ntok > e->wm) e->wm = p + ntok;
@@ -3342,11 +3513,27 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                         if (!dup) bases[nb++] = b;
                     }
                 }
+                if (getenv("GGML_AXCL_FLUSH_DEBUG") && nb > 0) {
+                    fprintf(stderr, "[kbase] nb=%d want=%d:", nb, 2 * kv_layers);
+                    for (int j = 0; j < nb && j < 6; j++) {
+                        fprintf(stderr, " [%lld,%lld,%lld]", (long long) bases[j]->ne[0],
+                                (long long) bases[j]->ne[1], (long long) bases[j]->ne[2]);
+                    }
+                    fprintf(stderr, "\n");
+                }
                 if (nb == 2 * kv_layers) {
+                    // snapshot VALUES (data ptr, row stride, element type):
+                    // the view tensors die on graph rebuilds, the underlying
+                    // KV buffer does not. First capture sticks unless a later
+                    // graph offers a different buffer (context recreated).
                     for (int k = 0; k < kv_layers; k++) {
                         const int l = g_layer.kind == 1 ? g_layer.attn_layers[k] : k;
-                        g_layer.kbase[l] = bases[2 * k];
-                        g_layer.vbase[l] = bases[2 * k + 1];
+                        g_layer.kdata[l] = bases[2 * k]->data;
+                        g_layer.knb1[l] = bases[2 * k]->nb[1];
+                        g_layer.ktype[l] = (int32_t) bases[2 * k]->type;
+                        g_layer.vdata[l] = bases[2 * k + 1]->data;
+                        g_layer.vnb1[l] = bases[2 * k + 1]->nb[1];
+                        g_layer.vtype[l] = (int32_t) bases[2 * k + 1]->type;
                     }
                 }
             }
@@ -3401,8 +3588,12 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     if (axclrtMallocHost(&g_layer.pin_hidden, 2048) != AXCL_SUCC) return GGML_STATUS_ABORTED;
                 }
                 // batched-ladder staging: one contiguous bf16 slab for the
-                // whole batch (m <= 1152 covers the group ladder)
-                const bool can_batch = g_layer.n_groups > 1 && m > 1 && m <= 1152;
+                // whole batch. kind0: the original 1152 cap (shallow
+                // llm_build2 ladders still batched big prompts — chunks
+                // beyond the last rung fall back per-token). kind1: full
+                // ladder coverage (11 groups -> 1280).
+                const int ladder_batch = g_layer.kind == 1 ? (g_layer.n_groups - 1) * 128 : 1152;
+                const bool can_batch = g_layer.n_groups > 1 && m > 1 && m <= ladder_batch;
                 if (can_batch) {
                     if (g_layer.h_all_a == nullptr) {
                         if (axclrtMalloc(&g_layer.h_all_a, (size_t) m * 2048, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
@@ -3412,7 +3603,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                         }
                     }
                 }
-                if (g_layer.n_groups > 1 && m > 1 && m <= 1152 && g_layer.h_all_a != nullptr) {
+                if (g_layer.n_groups > 1 && m > 1 && m <= ladder_batch && g_layer.h_all_a != nullptr) {
                     uint16_t * hb = (uint16_t *) g_layer.pin_h_all;
                     for (int t = 0; t < m; t++) {
                         axcl_f32_to_bf16((const float *) node->data + (size_t) t * node->nb[1] / 4,
@@ -3428,7 +3619,7 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 // MUST match the dispatch-level batching condition exactly
                 // (env-gated): rows [1, t0_stage) are only skipped when the
                 // chunk ladder will actually consume them.
-                const bool batching = g_layer.n_groups > 1 && m > 1 && m <= 1152 && g_layer.h_all_a != nullptr &&
+                const bool batching = g_layer.n_groups > 1 && m > 1 && m <= ladder_batch && g_layer.h_all_a != nullptr &&
                                        getenv("GGML_AXCL_BATCH") != nullptr;
                 const int t0_stage = batching ? (m / 128) * 128 : 0;
                 for (int t = 0; t < m; t++) {
@@ -3470,7 +3661,8 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 // runtime never calls groups != 0 (traced: 18k group-0
                 // executes, zero chunk groups, on a 300-token prompt).
                 // Per-token prefill through group 0 runs ~55 t/s.
-                const bool batching = m > 1 && g_layer.n_groups > 1 && m <= 1152 && g_layer.h_all_a != nullptr &&
+                const int ladder_batch2 = g_layer.kind == 1 ? (g_layer.n_groups - 1) * 128 : 1152;
+                const bool batching = m > 1 && g_layer.n_groups > 1 && m <= ladder_batch2 && g_layer.h_all_a != nullptr &&
                                        getenv("GGML_AXCL_BATCH") != nullptr;
                 if (batching) {
                     // chunk ladder: full 128-token chunks through shape groups
@@ -3505,7 +3697,8 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                                          (size_t) (128 - real) * 2048, AXCL_MEMCPY_HOST_TO_DEVICE);
                         }
                         (void) no_pad;
-                        if (!axcl_layer_run_chunk(l, p, 128)) {
+                        if (!(g_layer.kind == 1 ? axcl_layer_run_chunk(l, p, 128, real)
+                                : axcl_layer_run_chunk_q3(l, p, 128))) {
                             // never abort: finish this layer per-token from
                             // the failed chunk onward (correct on any ladder)
                             for (int t = c * 128; t < m; t++) {
