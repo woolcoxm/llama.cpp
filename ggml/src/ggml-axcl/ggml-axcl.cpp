@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <sys/types.h>
@@ -81,15 +82,188 @@ static bool axcl_global_init() {
     return available;
 }
 
+//
+// card-drop resilience (FINDINGS "Card stability rules"): a host process
+// dying with NPU work in flight wedges the card until wall power. Three
+// defenses here: bounded wait for post-boot/reload enumeration, fail-fast
+// (never submit work to a dead PCIe channel), and best-effort runtime
+// teardown from signal handlers. The vendor runtime additionally exposes
+// axclrtRebootDevice() — a software card reset — fired automatically from
+// the device-status callback when the EP reports OFFLINE (axcl_rt_device.h
+// documents exactly this pattern), so a dropped card self-heals instead of
+// waiting for someone to pull the plug.
+//
+
+// seconds to wait for the card to appear before giving up (0 = never wait);
+// absorbs the enumeration race after boot and driver reloads
+static int axcl_connect_budget_s() {
+    static const int budget = []() {
+        const char * e = getenv("GGML_AXCL_CONNECT_TIMEOUT");
+        return e ? atoi(e) : 15;
+    }();
+    return budget < 0 ? 0 : budget;
+}
+
+static axclrtContext g_axcl_ctx = 0; // thread-local bind target for worker threads
+
+static std::atomic<bool> g_axcl_card_offline { false };
+
+static void axcl_device_status_cb(int32_t device, AXCL_DEVICE_STATUS_E status, void * userdata) {
+    (void) userdata;
+    if (status != AXCL_DEVICE_STATUS_OFFLINE) {
+        return;
+    }
+    if (g_axcl_card_offline.exchange(true)) {
+        return; // already handled; log once
+    }
+    GGML_LOG_ERROR("ggml-axcl: NPU device %d went OFFLINE (PCIe drop / EP panic)\n", device);
+    const char * no_reboot = getenv("GGML_AXCL_AUTO_REBOOT");
+    if (no_reboot && strcmp(no_reboot, "0") == 0) {
+        GGML_LOG_ERROR("ggml-axcl: auto-reboot disabled — recover with card_reset.sh; "
+                       "this process must exit and restart\n");
+        return;
+    }
+    GGML_LOG_ERROR("ggml-axcl: issuing software card reboot (axclrtRebootDevice). Engine state "
+                   "is lost either way; this process must exit and restart into a healthy card\n");
+    if (axclrtRebootDevice(device) != AXCL_SUCC) {
+        GGML_LOG_ERROR("ggml-axcl: axclrtRebootDevice(%d) FAILED — run card_reset.sh, "
+                       "wall-power cycle as last resort\n", device);
+    }
+}
+
+// wait for the device manager to report a connected card and return its slot
+// index, or -1 if it never appeared within the connect budget
+static int32_t axcl_wait_connected_index() {
+    const int budget = axcl_connect_budget_s();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(budget);
+    bool warned = false;
+    for (;;) {
+        axclrtDeviceList dl;
+        memset(&dl, 0, sizeof(dl));
+        if (axclrtGetDeviceList(&dl) == AXCL_SUCC && dl.num > 0) {
+            return dl.devices[0];
+        }
+        if (budget == 0 || std::chrono::steady_clock::now() >= deadline) {
+            return -1;
+        }
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("ggml-axcl: device manager reports no connected NPU — waiting up to %ds "
+                          "(enumeration race after boot / driver reload?)\n", budget);
+        }
+        usleep(500 * 1000);
+    }
+}
+
+// idempotent runtime teardown, safe to call from atexit AND from fatal
+// signal handlers: the finalize flag is claimed at ENTRY so a second call
+// (the alarm watchdog firing inside a hung finalize) returns immediately
+static std::atomic<bool> g_axcl_finalized { false };
+static std::atomic<bool> g_axcl_engines_active { false };
+
+static void axcl_runtime_finalize() {
+    bool expected = false;
+    if (!g_axcl_finalized.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    if (g_axcl_engines_active.exchange(false)) {
+        axclrtSetCurrentContext(g_axcl_ctx);
+        axclrtEngineFinalize();
+    }
+    axclFinalize();
+}
+
+static std::atomic<bool> g_axcl_graceful_stop { false };
+
+static void axcl_sigterm_handler(int sig) {
+    (void) sig;
+    // dying mid-execute wedges the card: flag compute to stop between engine
+    // calls and let the app unwind to a normal exit (atexit finalize runs).
+    // alarm() is the death deadline so stop semantics survive apps that
+    // never call compute again (idle servers): 10s, then forced exit 143.
+    g_axcl_graceful_stop = true;
+    alarm(10);
+}
+
+static void axcl_alarm_handler(int sig) {
+    (void) sig;
+    // grace period expired without the app exiting: tear down best-effort
+    // and take the SIGTERM death (143) now
+    axcl_runtime_finalize();
+    _exit(143);
+}
+
+static void axcl_fatal_handler(int sig) {
+    // a crash mid-DMA is the card-wedge mechanism itself; tearing the runtime
+    // down before dying is last-resort prevention. alarm(3) guards against
+    // hanging inside a runtime whose thread crashed holding its locks.
+    signal(sig, SIG_DFL);
+    alarm(3);
+    axcl_runtime_finalize();
+    raise(sig);
+}
+
+static void axcl_install_signal_guards() {
+    const char * off = getenv("GGML_AXCL_SIGNAL_GUARD");
+    if (off && strcmp(off, "0") == 0) {
+        return;
+    }
+    struct sigaction sa;
+    struct sigaction old;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    // only install where the app hasn't installed its own disposition
+    if (sigaction(SIGTERM, nullptr, &old) == 0 && old.sa_handler == SIG_DFL) {
+        sa.sa_handler = axcl_sigterm_handler;
+        sa.sa_flags = 0;
+        sigaction(SIGTERM, &sa, nullptr);
+    }
+    if (sigaction(SIGALRM, nullptr, &old) == 0 && old.sa_handler == SIG_DFL) {
+        sa.sa_handler = axcl_alarm_handler;
+        sa.sa_flags = 0;
+        sigaction(SIGALRM, &sa, nullptr);
+    }
+    const int fatals[] = { SIGSEGV, SIGABRT, SIGBUS, SIGFPE };
+    for (int s : fatals) {
+        if (sigaction(s, nullptr, &old) == 0 && old.sa_handler == SIG_DFL) {
+            sa.sa_handler = axcl_fatal_handler;
+            sa.sa_flags = 0;
+            sigaction(s, &sa, nullptr);
+        }
+    }
+}
+
 static int32_t axcl_get_device_count() {
     if (!axcl_global_init()) {
         return 0;
     }
+    // reg-init runs before any process-side retry exists: a card mid-
+    // enumeration (boot / driver reload) reported as 0 devices registers
+    // ZERO NPU backends and llama falls back to CPU for the whole run.
+    // Poll within the shared connect budget; the deadline starts at the
+    // first empty result so later callers never re-wait.
+    static std::mutex              wait_mutex;
+    static std::chrono::steady_clock::time_point deadline {};
+    static bool                    deadline_set = false;
     uint32_t count = 0;
-    if (axclrtGetDeviceCount(&count) != AXCL_SUCC) {
-        return 0;
+    for (;;) {
+        if (axclrtGetDeviceCount(&count) == AXCL_SUCC && count > 0) {
+            return (int32_t) count;
+        }
+        const int budget = axcl_connect_budget_s();
+        if (budget == 0) {
+            return (int32_t) count;
+        }
+        std::lock_guard<std::mutex> lock(wait_mutex);
+        if (!deadline_set) {
+            deadline = std::chrono::steady_clock::now() + std::chrono::seconds(budget);
+            deadline_set = true;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return (int32_t) count;
+        }
+        usleep(500 * 1000);
     }
-    return (int32_t) count;
 }
 
 // the card's slot index is NOT 0 on switch-topology HATs (observed: 3).
@@ -325,8 +499,6 @@ struct axcl_matmul {
 };
 
 static void axcl_preload_all_engines();
-
-static axclrtContext g_axcl_ctx = 0; // thread-local bind target for worker threads
 
 // stage profiling: micros accumulated per stage, reported every REPORT computes
 #include <cstdint>
@@ -715,10 +887,25 @@ static bool axcl_engine_global_init() {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
     if (!initialized) {
+        initialized = true;
         // activation sequence discovered the hard way: GetDeviceList probes
         // and activates the device (also yields the real slot index);
-        // CreateContext/SetCurrentContext must precede EngineInit
-        int32_t dev = axcl_get_device_index(0);
+        // CreateContext/SetCurrentContext must precede EngineInit.
+        // axcl_wait_connected_index() also absorbs the boot/driver-reload
+        // enumeration race — the old code probed once and fell back to
+        // SetDevice(0), which is precisely what makes the runtime log
+        // "device 0 is not connected".
+        int32_t dev = axcl_wait_connected_index();
+        if (dev < 0) {
+            GGML_LOG_ERROR("ggml-axcl: no NPU device connected (waited %ds) — card absent or dropped. "
+                           "Recover with card_reset.sh; tune wait with GGML_AXCL_CONNECT_TIMEOUT\n",
+                           axcl_connect_budget_s());
+            // axclInit succeeded: its worker threads outlive main() and abort
+            // during exit handling unless finalized — with the device held,
+            // which is a wedge vector. Register the teardown now.
+            atexit(axcl_runtime_finalize);
+            return available;
+        }
         axclrtSetDevice(dev);
         axclrtContext ctx = 0;
         axclError  err  = axclrtCreateContext(&ctx, dev);
@@ -727,24 +914,33 @@ static bool axcl_engine_global_init() {
             axclrtSetCurrentContext(ctx);
             err = axclrtEngineInit(AXCL_VNPU_DISABLE);
         }
-        available = (err == AXCL_SUCC);
+        if (err != AXCL_SUCC && ctx) {
+            // partial activation: destroy the context so the device isn't
+            // held by a failed init (leaked context = runtime stays armed at
+            // exit with the card claimed)
+            axclrtSetCurrentContext(ctx);
+            axclrtDestroyContext(ctx);
+            g_axcl_ctx = 0;
+            ctx = 0;
+        }
+        available = (err == AXCL_SUCC && ctx != 0);
         if (!available) {
             GGML_LOG_ERROR("ggml-axcl: engine activation failed with %d\n", (int) err);
+            atexit(axcl_runtime_finalize);
+            return available;
         }
-        initialized = true;
-        if (available) {
-            // the runtime logs every context/device bind at INFO — silence it
-            // (it fires per graph compute and costs real time)
-            axclSetLogLevel(3); // warnings and above
-            // axcl_rt keeps worker threads alive past main(); without an
-            // explicit finalize they throw during exit handling. atexit runs
-            // before library teardown, so the runtime is still fully up here.
-            atexit([]() {
-                axclrtSetCurrentContext(g_axcl_ctx);
-                axclrtEngineFinalize();
-                axclFinalize();
-            });
-        }
+        // the runtime logs every context/device bind at INFO — silence it
+        // (it fires per graph compute and costs real time)
+        axclSetLogLevel(3); // warnings and above
+        // card-drop defenses: OFFLINE callback (auto software-reboot via
+        // axclrtRebootDevice) and crash-graceful signal guards
+        axclrtRegisterDeviceStatusCallback(axcl_device_status_cb, nullptr);
+        axcl_install_signal_guards();
+        g_axcl_engines_active = true;
+        // axcl_rt keeps worker threads alive past main(); without an
+        // explicit finalize they throw during exit handling. atexit runs
+        // before library teardown, so the runtime is still fully up here.
+        atexit(axcl_runtime_finalize);
     }
     return available;
 }
@@ -3341,6 +3537,18 @@ static bool axcl_qkv_try_flush() {
 
 static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_axcl_context * ctx = (ggml_backend_axcl_context *) backend->context;
+    // fail-fast guards: submitting work to a dead PCIe channel is what turns
+    // a transient drop into a wedge-until-power-cycle
+    if (g_axcl_card_offline.load(std::memory_order_relaxed)) {
+        GGML_LOG_ERROR("ggml-axcl: card offline (device dropped) — refusing NPU work; "
+                       "this process must exit; restart after recovery\n");
+        return GGML_STATUS_FAILED;
+    }
+    if (g_axcl_graceful_stop.load(std::memory_order_relaxed)) {
+        // SIGTERM received: stop between engine calls so the process can
+        // unwind to a clean exit (atexit finalize) instead of dying mid-execute
+        return GGML_STATUS_ABORTED;
+    }
     axclrtSetDevice(axcl_get_device_index(ctx->device));
     if (g_axcl_ctx) {
         axclrtSetCurrentContext(g_axcl_ctx); // contexts are thread-local: bind worker threads
