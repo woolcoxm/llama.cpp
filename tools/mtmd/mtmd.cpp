@@ -1469,6 +1469,12 @@ struct mtmd_tokenizer {
                     // for Qwen2VL, we need this information for M-RoPE decoding positions
                     image_tokens->nx = clip_n_output_tokens_x(ctx->ctx_v, &preproc_out.entries[0]);
                     image_tokens->ny = clip_n_output_tokens_y(ctx->ctx_v, &preproc_out.entries[0]);
+                } else if (getenv("GGML_AXCL_NPU_VISION_EMBD")) {
+                    // fork-local (ggml-axcl): NPU vision tower — the vendor
+                    // engine's fixed 384x384 input yields a 12x12 merged
+                    // grid, regardless of the mmproj's dynamic resolution
+                    image_tokens->nx = 12;
+                    image_tokens->ny = 12;
                 } else {
                     // other models, we only need the total number of tokens
                     image_tokens->nx = n_tokens;
@@ -1722,6 +1728,35 @@ static int32_t mtmd_encode_impl(mtmd_context * ctx, const mtmd_image_tokens * im
     if (image_tokens->is_placeholder()) {
         LOG_ERR("%s: image tokens batch is placeholder\n", __func__);
         return 1;
+    }
+
+    // fork-local (ggml-axcl): NPU vision tower — when
+    // GGML_AXCL_NPU_VISION_EMBD points at embeddings produced by
+    // gemm/axcl_vision.c (vendor qwen3_5_vision.axmodel, 45 ms/image on the
+    // AX8850), use them instead of the CPU mmproj tower. The engine's fixed
+    // 384x384 input yields a 12x12 merged token grid.
+    if (const char * npu_env = getenv("GGML_AXCL_NPU_VISION_EMBD")) {
+        FILE * f = fopen(npu_env, "rb");
+        if (!f) {
+            LOG_ERR("%s: cannot open NPU vision embeddings %s\n", __func__, npu_env);
+            return 1;
+        }
+        const uint32_t NX = 12, NY = 12; // 24x24 patches, 2x2 merge
+        out_embd.resize((size_t) NX * NY * n_embd_out);
+        if (fread(out_embd.data(), 4, out_embd.size(), f) != out_embd.size()) {
+            LOG_ERR("%s: short read on %s (want %zu floats)\n", __func__, npu_env, out_embd.size());
+            fclose(f);
+            return 1;
+        }
+        fclose(f);
+        // image_tokens is const in this path; the splice downstream reads
+        // nx/ny for token count + mrope grid — patch them in place (encode
+        // is single-threaded per chunk)
+        const_cast<mtmd_image_tokens *>(image_tokens)->nx = NX;
+        const_cast<mtmd_image_tokens *>(image_tokens)->ny = NY;
+        const_cast<mtmd_image_tokens *>(image_tokens)->batch_f32.entries.resize(1);
+        LOG_INF("%s: using NPU vision embeddings (%u x %u grid)\n", __func__, NX, NY);
+        return 0;
     }
 
     bool ok = clip_image_batch_encode(

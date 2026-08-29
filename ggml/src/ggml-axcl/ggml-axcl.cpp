@@ -1403,6 +1403,114 @@ static bool ggml_axcl_host_op(struct ggml_tensor * node) {
             }
             break;
         }
+        case GGML_OP_UNARY: {
+            const int64_t n = ggml_nbytes(node) / 4;
+            const int uop = ggml_get_op_params_i32(node, 0);
+            const float * x = (const float *) node->src[0]->data;
+            float * y = (float *) node->data;
+            for (int64_t i = 0; i < n; i++) {
+                const float v = x[i];
+                switch (uop) {
+                    case GGML_UNARY_OP_SILU:   y[i] = v / (1.0f + expf(-v)); break;
+                    case GGML_UNARY_OP_GELU:   y[i] = 0.5f * v * (1.0f + erff(v * 0.70710677f)); break;
+                    case GGML_UNARY_OP_EXP:    y[i] = expf(v); break;
+                    case GGML_UNARY_OP_NEG:    y[i] = -v; break;
+                    case GGML_UNARY_OP_ABS:    y[i] = fabsf(v); break;
+                    case GGML_UNARY_OP_STEP:   y[i] = v > 0 ? 1.0f : 0.0f; break;
+                    case GGML_UNARY_OP_RELU:   y[i] = v > 0 ? v : 0.0f; break;
+                    case GGML_UNARY_OP_SGN:    y[i] = v > 0 ? 1 : v < 0 ? -1 : 0; break;
+                    case GGML_UNARY_OP_TANH:   y[i] = tanhf(v); break;
+                    case GGML_UNARY_OP_SIGMOID:y[i] = 1.0f / (1.0f + expf(-v)); break;
+                    case GGML_UNARY_OP_GELU_QUICK: y[i] = v * (1.0f / (1.0f + expf(-1.702f * v))); break;
+                    case GGML_UNARY_OP_ELU:    y[i] = v > 0 ? v : expf(v) - 1; break;
+                    case GGML_UNARY_OP_HARDSWISH: y[i] = v <= -3 ? 0 : v >= 3 ? v : v * (v + 3) / 6; break;
+                    case GGML_UNARY_OP_HARDSIGMOID: y[i] = fmaxf(0.0f, fminf(1.0f, v / 6.0f + 0.5f)); break;
+                    case GGML_UNARY_OP_EXPM1:   y[i] = expf(v) - 1; break;
+                    case GGML_UNARY_OP_SOFTPLUS: y[i] = logf(1.0f + expf(v)); break;
+                    case GGML_UNARY_OP_GELU_ERF: y[i] = 0.5f * v * (1.0f + erff(v * 0.70710677f)); break;
+                    case GGML_UNARY_OP_FLOOR:   y[i] = floorf(v); break;
+                    case GGML_UNARY_OP_CEIL:    y[i] = ceilf(v); break;
+                    default:
+                        fprintf(stderr, "[axcl] unhandled unary op %d\n", uop);
+                        GGML_ASSERT(false && "unhandled unary op");
+                }
+            }
+            return true;
+        }
+        case GGML_OP_CONCAT: {
+            // dim-1 concat, any dtype, contiguous rows (fresh ggml outputs)
+            const size_t es = ggml_type_size(node->src[0]->type);
+            const int64_t w0 = node->src[0]->ne[0], w1 = node->src[1]->ne[0];
+            const int64_t rows0 = node->src[0]->ne[1], rows1 = node->src[1]->ne[1];
+            if (node->ne[1] == rows0 + rows1) {
+                // dim-1 row append
+                for (int64_t i = 0; i < rows0; i++) {
+                    memcpy((char *) node->data + (size_t) i * node->nb[1],
+                           (const char *) node->src[0]->data + (size_t) i * node->src[0]->nb[1],
+                           (size_t) w0 * es);
+                }
+                for (int64_t i = 0; i < rows1; i++) {
+                    memcpy((char *) node->data + (size_t) (i + rows0) * node->nb[1],
+                           (const char *) node->src[1]->data + (size_t) i * node->src[1]->nb[1],
+                           (size_t) w1 * es);
+                }
+            } else {
+                // dim-0 width concat (same row count)
+                GGML_ASSERT(node->ne[0] == w0 + w1 && rows0 == rows1);
+                for (int64_t i = 0; i < rows0; i++) {
+                    char * d = (char *) node->data + (size_t) i * node->nb[1];
+                    memcpy(d, (const char *) node->src[0]->data + (size_t) i * node->src[0]->nb[1],
+                           (size_t) w0 * es);
+                    memcpy(d + (size_t) w0 * es,
+                           (const char *) node->src[1]->data + (size_t) i * node->src[1]->nb[1],
+                           (size_t) w1 * es);
+                }
+            }
+            return true;
+        }
+        case GGML_OP_CUMSUM: {
+            // exclusive cumsum along dim 0 (qwen mrope position build);
+            // I32 for position ids, F32 for other glue
+            const int64_t n = node->src[0]->ne[0];
+            const bool is_i32 = node->src[0]->type == GGML_TYPE_I32;
+            const int64_t rows = node->src[0]->ne[1];
+            for (int64_t r = 0; r < rows; r++) {
+                if (is_i32) {
+                    const int32_t * s = (const int32_t *) node->src[0]->data + r * n;
+                    int32_t * d = (int32_t *) node->data + r * n;
+                    int32_t acc = 0;
+                    for (int64_t i = 0; i < n; i++) { d[i] = acc; acc += s[i]; }
+                } else {
+                    const float * s = (const float *) node->src[0]->data + r * n;
+                    float * d = (float *) node->data + r * n;
+                    float acc = 0;
+                    for (int64_t i = 0; i < n; i++) { d[i] = acc; acc += s[i]; }
+                }
+            }
+            return true;
+        }
+        case GGML_OP_PAD: {
+            GGML_ASSERT(node->src[0]->type == GGML_TYPE_F32);
+            const int64_t c = node->src[0]->ne[0];
+            const int64_t rows_s = node->src[0]->ne[1];
+            for (int64_t i = 0; i < node->ne[1]; i++) {
+                float * d = (float *)((char *) node->data + (size_t) i * node->nb[1]);
+                memset(d, 0, (size_t) node->ne[0] * 4);
+                if (i < rows_s) {
+                    memcpy(d, (const char *) node->src[0]->data + (size_t) i * node->src[0]->nb[1],
+                           (size_t) c * 4);
+                }
+            }
+            return true;
+        }
+        case GGML_OP_ARANGE: {
+            const double st = (int32_t) ggml_get_op_params_i32(node, 0);
+            const double step = (int32_t) ggml_get_op_params_i32(node, 2);
+            for (int64_t i = 0; i < node->ne[0]; i++) {
+                ((float *) node->data)[i] = (float) (st + step * i);
+            }
+            return true;
+        }
         case GGML_OP_CPY:
         case GGML_OP_DUP:
         case GGML_OP_CONT: {
@@ -3256,7 +3364,15 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 fprintf(stderr, "\n");
             }
         }
-        const bool armable = gets == 1 && anchors == g_layer.n_layer;
+        const bool armable = (gets == 1 || g_layer.embd_batch) && anchors == g_layer.n_layer;
+        if (getenv("GGML_AXCL_LAYER_DEBUG") && !armable) {
+            fprintf(stderr, "[prescan-noarm] nodes=%d gets=%d anchors=%d embd_batch=%d inp_embd=%p head-ops:",
+                    cgraph->n_nodes, gets, anchors, (int) g_layer.embd_batch, (void *) g_layer.inp_embd);
+            for (int j = 0; j < cgraph->n_nodes && j < 16; j++) {
+                fprintf(stderr, " %s", ggml_op_name(cgraph->nodes[j]->op));
+            }
+            fprintf(stderr, "\n");
+        }
         (void) all_m1;
         if (armable) {
             layer_armed = true;
@@ -3503,13 +3619,18 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                     embd_slab_rows = embd_slab ? m : 0;
                 }
                 if (embd_slab) {
-                    uint16_t * hb = slab ? (uint16_t *) g_layer.pin_h_all : (uint16_t *) g_layer.pin_hidden;
+                    // per-row staging: pin_hidden is ONE row (2 KB). A bulk
+                    // m-row write through it overran the pinned allocator's
+                    // neighbors and detonated at the next free (heap abort).
                     for (int t = 0; t < m; t++) {
                         const float * row = (const float *)((char *) g_layer.inp_embd->data + (size_t) t * g_layer.inp_embd->nb[1]);
-                        axcl_f32_to_bf16(row, hb + (size_t) t * 1024, 1024);
+                        axcl_f32_to_bf16(row, (uint16_t *) g_layer.pin_hidden, 1024);
                         g_layer.d_hidden_m[t] = (char *) embd_slab + (size_t) t * 2048;
+                        axclrtMemcpy(g_layer.d_hidden_m[t], g_layer.pin_hidden, 2048, AXCL_MEMCPY_HOST_TO_DEVICE);
+                        if (slab) {
+                            axcl_f32_to_bf16(row, (uint16_t *) g_layer.pin_h_all + (size_t) t * 1024, 1024);
+                        }
                     }
-                    axclrtMemcpy(embd_slab, hb, (size_t) m * 2048, AXCL_MEMCPY_HOST_TO_DEVICE);
                 }
                 if (slab) {
                     axclrtMemcpy(g_layer.h_all_a, g_layer.pin_h_all, (size_t) m * 2048, AXCL_MEMCPY_HOST_TO_DEVICE);
@@ -4816,6 +4937,9 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
                 }
                 return layer_mode;
             }
+            // glue ops (CONCAT/PAD/CUMSUM/ARANGE/UNARY) are HOST-computed
+            // in graph_compute — claiming them keeps every graph whole (no
+            // scheduler splits), which is what whole-layer mode requires
             case GGML_OP_FLASH_ATTN_EXT:
                 // FA only when explicitly enabled: the FA host-op was the
                 // default-claim inversion bug (claimed when env UNSET) that
