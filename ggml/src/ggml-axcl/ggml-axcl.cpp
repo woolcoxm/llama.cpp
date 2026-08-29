@@ -2116,6 +2116,10 @@ struct axcl_layer_ctx {
     // for ALL chunks must persist while layer l runs) + host staging
     void * h_all_a = nullptr, * h_all_b = nullptr; // [m<=1152,1024] bf16
     void * pin_h_all = nullptr;
+    int h_all_rows = 0; // capacity in rows — the first batch to allocate
+                        // sizes these; larger later batches (e.g. a 144-token
+                        // image ubatch after a 4-token text prefix) MUST grow
+                        // them or the staging writes past the buffers
     void * batched_last_hbuf = nullptr; // h_all_* holding the last layer's out
 };
 static axcl_layer_ctx g_layer;
@@ -3601,11 +3605,18 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 }
                 const int ladder_batch_v = g_layer.kind == 1 ? (g_layer.n_groups - 1) * 128 : 1152;
                 bool slab = g_layer.n_groups > 1 && m > 1 && m <= ladder_batch_v;
-                if (slab && g_layer.h_all_a == nullptr) {
+                if (slab && g_layer.h_all_rows < m) {
+                    if (g_layer.h_all_a) axclrtFree(g_layer.h_all_a);
+                    if (g_layer.h_all_b) axclrtFree(g_layer.h_all_b);
+                    if (g_layer.pin_h_all) axclrtFreeHost(g_layer.pin_h_all);
+                    g_layer.h_all_a = g_layer.h_all_b = g_layer.pin_h_all = nullptr;
                     if (axclrtMalloc(&g_layer.h_all_a, (size_t) m * 2048, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
                         axclrtMalloc(&g_layer.h_all_b, (size_t) m * 2048, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
                         axclrtMallocHost(&g_layer.pin_h_all, (size_t) m * 2048) != AXCL_SUCC) {
+                        g_layer.h_all_rows = 0;
                         slab = false;
+                    } else {
+                        g_layer.h_all_rows = m;
                     }
                 }
                 // ONE device slab for all rows — hundreds of tiny per-row
@@ -3787,11 +3798,18 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
                 const int ladder_batch = g_layer.kind == 1 ? (g_layer.n_groups - 1) * 128 : 1152;
                 const bool can_batch = g_layer.n_groups > 1 && m > 1 && m <= ladder_batch;
                 if (can_batch) {
-                    if (g_layer.h_all_a == nullptr) {
+                    if (g_layer.h_all_rows < m) {
+                        if (g_layer.h_all_a) axclrtFree(g_layer.h_all_a);
+                        if (g_layer.h_all_b) axclrtFree(g_layer.h_all_b);
+                        if (g_layer.pin_h_all) axclrtFreeHost(g_layer.pin_h_all);
+                        g_layer.h_all_a = g_layer.h_all_b = g_layer.pin_h_all = nullptr;
                         if (axclrtMalloc(&g_layer.h_all_a, (size_t) m * 2048, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
                             axclrtMalloc(&g_layer.h_all_b, (size_t) m * 2048, AXCL_MEM_MALLOC_HUGE_FIRST) != AXCL_SUCC ||
                             axclrtMallocHost(&g_layer.pin_h_all, (size_t) m * 2048) != AXCL_SUCC) {
+                            g_layer.h_all_rows = 0;
                             g_layer.n_groups = 1;
+                        } else {
+                            g_layer.h_all_rows = m;
                         }
                     }
                 }
@@ -4599,6 +4617,19 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             }
         } else {
             GGML_LOG_ERROR("ggml-axcl: node %d op %s not supported\n", i, ggml_op_name(node->op));
+            if (getenv("GGML_AXCL_LAYER_DEBUG")) {
+                fprintf(stderr, "[abort-dump] graph nodes=%d armed=%d n_tok=%d:\n",
+                        cgraph->n_nodes, (int) g_layer.armed, g_layer.n_tok);
+                for (int j = 0; j < cgraph->n_nodes && j < 48; j++) {
+                    struct ggml_tensor * n2 = cgraph->nodes[j];
+                    fprintf(stderr, "  [%2d] %-14s ne=[%lld,%lld,%lld] src0=[%lld,%lld] %s\n", j,
+                            ggml_op_name(n2->op),
+                            (long long) n2->ne[0], (long long) n2->ne[1], (long long) n2->ne[2],
+                            n2->src[0] ? (long long) n2->src[0]->ne[0] : -1,
+                            n2->src[0] ? (long long) n2->src[0]->ne[1] : -1,
+                            (n2->name && n2->name[0]) ? n2->name : "");
+                }
+            }
             return GGML_STATUS_ABORTED;
         }
     }
@@ -4935,6 +4966,9 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
                     snprintf(want, sizeof(want), ",%s,", ggml_op_name(op->op));
                     return strstr(buf, want) != nullptr;
                 }
+                if (!layer_mode && getenv("GGML_AXCL_DECLINE_DEBUG")) {
+                    fprintf(stderr, "[declined-meta] %s\n", ggml_op_name(op->op));
+                }
                 return layer_mode;
             }
             // glue ops (CONCAT/PAD/CUMSUM/ARANGE/UNARY) are HOST-computed
@@ -4963,6 +4997,11 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
     }
     if (op->op == GGML_OP_FLASH_ATTN_EXT) {
         return getenv("GGML_AXCL_FA") != nullptr;
+    }
+    if (getenv("GGML_AXCL_DECLINE_DEBUG") && op->op != GGML_OP_MUL_MAT) {
+        fprintf(stderr, "[declined] %s src0=[%lld,%lld]\n", ggml_op_name(op->op),
+                op->src[0] ? (long long) op->src[0]->ne[0] : -1,
+                op->src[0] ? (long long) op->src[0]->ne[1] : -1);
     }
     return op->op == GGML_OP_MUL_MAT;
 }

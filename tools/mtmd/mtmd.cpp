@@ -1469,16 +1469,19 @@ struct mtmd_tokenizer {
                     // for Qwen2VL, we need this information for M-RoPE decoding positions
                     image_tokens->nx = clip_n_output_tokens_x(ctx->ctx_v, &preproc_out.entries[0]);
                     image_tokens->ny = clip_n_output_tokens_y(ctx->ctx_v, &preproc_out.entries[0]);
-                } else if (getenv("GGML_AXCL_NPU_VISION_EMBD")) {
-                    // fork-local (ggml-axcl): NPU vision tower — the vendor
-                    // engine's fixed 384x384 input yields a 12x12 merged
-                    // grid, regardless of the mmproj's dynamic resolution
-                    image_tokens->nx = 12;
-                    image_tokens->ny = 12;
                 } else {
                     // other models, we only need the total number of tokens
                     image_tokens->nx = n_tokens;
                     image_tokens->ny = 1;
+                }
+                if (getenv("GGML_AXCL_NPU_VISION_EMBD")) {
+                    // fork-local (ggml-axcl): NPU vision tower — the vendor
+                    // engine's fixed 384x384 input yields a 12x12 merged grid
+                    // regardless of the mmproj's dynamic resolution. Must
+                    // override AFTER both branches (qwen35 is M-RoPE) so the
+                    // tokenize splice matches the encoder's 144 rows.
+                    image_tokens->nx = 12;
+                    image_tokens->ny = 12;
                 }
                 image_tokens->pos = ctx->pos_type;
                 // HunyuanVL wraps the image grid with BOI/EOI and adds one newline per row,
