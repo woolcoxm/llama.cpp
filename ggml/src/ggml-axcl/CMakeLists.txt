@@ -45,6 +45,9 @@ target_link_libraries(ggml-axcl PRIVATE
     ${AXCL_NPU_LIB}
     -Wl,--as-needed
 )
+# CPU reference fallback for auxiliary graphs (state shift, input prep) that
+# whole-layer mode claims whole but the NPU engines do not handle
+target_link_libraries(ggml-axcl PRIVATE ggml-cpu)
 target_include_directories(ggml-axcl PRIVATE ${AXCL_INCLUDE_DIRS})
 
 message(STATUS "ggml-axcl: AXCL_INCLUDE_DIRS = ${AXCL_INCLUDE_DIRS}")

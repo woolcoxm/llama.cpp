@@ -13,6 +13,7 @@
 #include "ggml-axcl.h"
 
 #include "axcl.h"
+#include "ggml-cpu.h"
 #include "axcl_rt_device.h"
 #include "axcl_rt_memory.h"
 #include "axcl_rt_type.h"
@@ -107,6 +108,31 @@ static int axcl_connect_budget_s() {
 static axclrtContext g_axcl_ctx = 0; // thread-local bind target for worker threads
 
 static std::atomic<bool> g_axcl_card_offline { false };
+
+// host-side fallback backend: whole-layer mode's broad claim set routes EVERY
+// graph the scheduler builds to this backend, but only the anchor-structured
+// transformer graph is handled by the NPU engines. The remaining auxiliary
+// graphs — llama.cpp's input-prep and KV/SSM state-shift graphs, the
+// scheduler's reserve probes — arrive whole but contain ops the per-op host
+// path never implemented (SSM_CONV/SSM_SCAN/...), which aborted decode with
+// "node N op SSM_CONV not supported". Compute those graphs with the reference
+// CPU backend instead. Our buffer type IS the CPU buffer type, so this runs
+// in place on the same host tensors — zero copies, bit-exact reference math.
+static ggml_backend_t g_axcl_fallback_cpu = nullptr;
+static enum ggml_status axcl_host_fallback_compute(struct ggml_cgraph * cgraph) {
+    if (g_axcl_fallback_cpu == nullptr) {
+        g_axcl_fallback_cpu = ggml_backend_cpu_init();
+        if (g_axcl_fallback_cpu != nullptr) {
+            // aux graphs are tiny (tens of nodes); a few threads are plenty
+            // and keep the NPU decode path's host cores free
+            ggml_backend_cpu_set_n_threads(g_axcl_fallback_cpu, 4);
+        }
+    }
+    if (g_axcl_fallback_cpu == nullptr) {
+        return GGML_STATUS_ALLOC_FAILED; // caller falls through to per-op
+    }
+    return ggml_backend_graph_compute(g_axcl_fallback_cpu, cgraph);
+}
 
 static void axcl_device_status_cb(int32_t device, AXCL_DEVICE_STATUS_E status, void * userdata) {
     (void) userdata;
@@ -266,16 +292,23 @@ static int32_t axcl_get_device_count() {
     }
 }
 
-// the card's slot index is NOT 0 on switch-topology HATs (observed: 3).
+// the card's slot index is NOT 0 on switch-topology HATs (observed: 3 and 4).
 // axclrtGetDeviceList() is also the mandatory activation probe: without it
-// the device manager reports every device as "not connected"
+// the device manager reports every device as "not connected". The manager can
+// return an empty list for a moment after axclInit while activation completes
+// (observed on switch HATs, where index 0 is an EMPTY switch port): retry
+// briefly instead of falling back to 0, which is exactly what makes the
+// runtime log "device 0 is not connected"
 static int32_t axcl_get_device_index(int32_t ordinal) {
     axclrtDeviceList dl;
     memset(&dl, 0, sizeof(dl));
-    if (axclrtGetDeviceList(&dl) != AXCL_SUCC || dl.num == 0) {
-        return 0;
+    for (int attempt = 0; attempt < 30; attempt++) {
+        if (axclrtGetDeviceList(&dl) == AXCL_SUCC && dl.num > 0) {
+            return dl.devices[ordinal < (int32_t) dl.num ? ordinal : 0];
+        }
+        usleep(100 * 1000);
     }
-    return dl.devices[ordinal < (int32_t) dl.num ? ordinal : 0];
+    return 0;
 }
 
 static std::string axcl_get_device_description(int32_t device) {
@@ -3605,6 +3638,21 @@ static enum ggml_status ggml_backend_axcl_graph_compute(ggml_backend_t backend, 
             fprintf(stderr, "\n");
         }
         (void) all_m1;
+        if (!armable) {
+            // non-armed graph: an auxiliary graph (input prep, KV/SSM state
+            // shift, scheduler reserve probe) or an unexpected variant. The
+            // broad layer-mode claim delivers it here whole, but the per-op
+            // host path implements neither its SSM ops nor a full graph — it
+            // died with "node N op SSM_CONV not supported". Materialize any
+            // device-authoritative KV rows first (dirty-KV guard: this graph
+            // runs zero engine calls), then compute the whole graph with the
+            // reference CPU backend, in place on the same host tensors.
+            axcl_layer_flush_kv_all();
+            enum ggml_status st = axcl_host_fallback_compute(cgraph);
+            if (st != GGML_STATUS_ALLOC_FAILED) {
+                return st;
+            }
+        }
         if (armable) {
             layer_armed = true;
             g_layer.armed = true;
@@ -5124,8 +5172,30 @@ static ggml_backend_buffer_t ggml_backend_axcl_device_buffer_from_host_ptr(ggml_
     return nullptr;
 }
 
+static bool ggml_backend_axcl_device_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tensor * op);
+
 static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
+    // GGML_AXCL_SUP_DEBUG=1: trace every claim decision (op -> claimed?)
+    static const char * sup_dbg = getenv("GGML_AXCL_SUP_DEBUG");
+    struct SupTrace {
+        bool on; int n = 0;
+        void log(const struct ggml_tensor * op, bool ok) {
+            if (!on || n >= 4000) return;
+            n++;
+            fprintf(stderr, "[sup] %s%s%s %lldx%lld -> %d\n", ggml_op_name(op->op),
+                    op->name && op->name[0] ? ":" : "", op->name ? op->name : "",
+                    op->src[0] ? (long long) op->src[0]->ne[0] : -1,
+                    op->src[0] ? (long long) op->src[0]->ne[1] : -1, (int) ok);
+        }
+    };
+    static SupTrace trace{sup_dbg != nullptr && sup_dbg[0] != '\0'};
+    bool AXCL_SUP_RESULT = ggml_backend_axcl_device_supports_op_impl(dev, op);
+    trace.log(op, AXCL_SUP_RESULT);
+    return AXCL_SUP_RESULT;
+}
+
+static bool ggml_backend_axcl_device_supports_op_impl(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     // UNIVERSAL BACKEND: accept every op — matmuls go to NPU engines,
     // everything else runs host-side in our graph_compute. This eliminates
     // ALL scheduler splits during inference.
@@ -5265,7 +5335,17 @@ static bool ggml_backend_axcl_device_supports_op(ggml_backend_dev_t dev, const s
 static bool ggml_backend_axcl_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(dev);
     // host-memory backend: any buffer marked host works (same as ggml-blas)
-    return ggml_backend_buft_is_host(buft);
+    if (ggml_backend_buft_is_host(buft)) {
+        return true;
+    }
+    // whole-layer mode: the NPU engines carry the weights, so the graph's
+    // weight tensors may live in ANY host-side buffer — notably the CPU
+    // backend's CPU_REPACK optimized-weights buffer, which is host RAM but
+    // not flagged GGML_BACKEND_BUFT_FLAG_HOST. Rejecting it routed every
+    // weight matmul to the CPU backend, splitting the graph into 300+
+    // scheduler fragments so the layer prescan never saw a whole graph and
+    // decode could not arm. Nothing outside host memory is ever touched.
+    return getenv("GGML_AXCL_LAYER") != nullptr;
 }
 
 static bool ggml_backend_axcl_device_offload_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
